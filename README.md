@@ -4,9 +4,13 @@ Cara coba demo plumber:
 
 1. Buka file plumber.R
 2. Run plumber.R atau tekan `ctrl + enter`
-3. Akan terbuka tampilan swagger.
-4. Copy informasi url
-5. Kemudian paste informasi url ke sintaks R di bawah:
+3. Akan terbuka tampilan swagger
+
+![](img/swagger.png)
+
+1. Copy informasi url, paste ke sintaks di bawah.
+2. Buka Rstudio di window baru.
+3. Jalankan sintaks di bawah
    
 ```
 bank_test <- structure(list(age = 35L, job = structure(5L, .Label = c("admin.", 
