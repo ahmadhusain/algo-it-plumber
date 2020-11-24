@@ -1,0 +1,303 @@
+---
+title: 'Telemarketing campaign: Multiple model'
+date: "`r format(Sys.Date(), '%B %e, %Y')`"
+output:
+  html_document:
+    theme: united
+    highlight: breezedark
+    toc: true
+    toc_float:
+      collapsed: true
+    df_print: paged
+---
+
+
+```{r setup, include=FALSE}
+# clear-up the environment
+rm(list = ls())
+
+# chunk options
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  comment = "#>"
+)
+
+options(scipen = 999)
+```
+
+```{r}
+library(tidyverse)
+library(caret)
+library(tidymodels)
+```
+
+
+```{r}
+bank <- read.csv("data/bank-sub.csv", stringsAsFactors = T)
+```
+
+```{r}
+head(bank)
+```
+
+
+```{r}
+srs_variable <- bank %>% 
+  select_if(is.factor) %>% 
+  colnames()
+```
+
+```{r}
+srs_variable
+```
+
+
+```{r}
+set.seed(100)
+
+library(splitstackshape)
+
+srs_bank <- stratified(indt = bank,
+                          group = srs_variable,
+                          size = 0.8,
+                          bothSets = TRUE)
+bank_train <- srs_bank$SAMP1 # data train 80%
+bank_test <- srs_bank$SAMP2 # data test 20%
+```
+
+
+# Modeling 
+
+```{r}
+# make sure all data is numerical, for Xgboost model.
+
+library(caret)
+
+dmy <- dummyVars(" ~ .", data = bank_train)
+train_boost <- data.frame(predict(dmy, newdata = bank_train))
+
+train_boost <- train_boost %>% select(-y.no) %>% mutate(y.yes = as.factor(y.yes))
+```
+
+
+```{r}
+head(train_boost)
+```
+
+```{r}
+dmy <- dummyVars(" ~ .", data = bank_test)
+test_boost <- data.frame(predict(dmy, newdata = bank_test))
+
+test_boost <- test_boost %>% select(-y.no) %>% mutate(y.yes = as.factor(y.yes))
+```
+
+```{r}
+df_model <- list(train_boost) %>% 
+  enframe(name = "id", value = "data_train") %>% 
+  bind_cols(
+    list(test_boost) %>% 
+      enframe(value = "data_test") %>% 
+      select(data_test)
+  )
+
+
+df_model
+```
+
+
+```{r}
+# prepare x and y colomn
+
+df_model <- df_model %>% 
+  transmute(
+    id,
+    train_x = map(data_train, ~.x %>% select(-y.yes)),
+    train_y = map(data_train, ~.x %>% pull(y.yes)),
+    test_x = map(data_test,  ~.x %>% select(-y.yes)),
+    test_y = map(data_test, ~.x %>% pull(y.yes))
+  )
+
+df_model
+```
+
+```{r}
+## xgboost
+
+xgb <- function(X,Y){
+  ctrl <- trainControl(
+    ## 2-fold CV
+    method = "repeatedcv",
+    number = 2
+  )
+  train(
+    x=X,
+    y=Y,
+    method = 'xgbTree',
+    trControl = ctrl,
+    preProc = c('center', 'scale')
+  )
+}
+
+```
+
+```{r}
+## gradient boosting
+
+gbm <- function(X, Y) {
+  ctrl <- trainControl(
+    ## 2-fold CV
+    method = "repeatedcv",
+    number = 2
+  )
+  train(
+    x = X,
+    y = Y,
+    method = 'gbm',
+    trControl = ctrl, 
+    preProc = c('center', 'scale')
+  )
+}
+```
+
+```{r}
+## random forest
+
+rf <- function(X, Y) {
+  ctrl <- trainControl(
+    ## 2-fold CV
+    method = "repeatedcv",
+    number = 2
+  )
+  train(
+    x = X,
+    y = Y,
+    method = 'rf',
+    trControl = ctrl, 
+    preProc = c('center', 'scale')
+  )
+}
+```
+
+```{r}
+## gradient boosting
+
+dtree <- function(X, Y) {
+  ctrl <- trainControl(
+    ## 2-fold CV
+    method = "repeatedcv",
+    number = 2
+  )
+  train(
+    x = X,
+    y = Y,
+    method = 'rpart',
+    trControl = ctrl, 
+    preProc = c('center', 'scale')
+  )
+}
+```
+
+```{r}
+model_list <- list(XgBoost = xgb,
+                   GradBoost = gbm,
+                   RandomForest = rf,
+                   DecisionTree = dtree) %>%
+  enframe(name = 'modelName',value = 'model')
+
+model_list
+```
+
+```{r}
+df_model <- df_model[rep(1:nrow(df_model),nrow(model_list)),]
+
+df_model
+```
+
+```{r}
+df_model <- df_model %>% 
+  bind_cols(
+    model_list %>% arrange(modelName)
+  ) %>% 
+  mutate(id = 1:nrow(.))
+
+df_model
+```
+
+```{r}
+model_fit <- df_model %>% 
+  mutate(
+    params = map2(train_x, train_y, ~list(X = .x, Y = .y)),
+    modelfits = invoke_map(model, params)
+  )
+```
+
+
+
+```{r}
+model_fit %>% 
+  select(modelName, params, modelfits)
+```
+
+
+
+```{r}
+result <- model_fit %>% 
+  # slice(2:3) %>% 
+  mutate(
+    prediction = map(modelfits, ~predict(.x, .x$train_x)),
+    acc = map2(prediction, train_y, ~MLmetrics::Accuracy(.x, .y)),
+    recall = map2(prediction, train_y, ~MLmetrics::Recall(.x, .y, positive = 1)),
+    precision = map2(prediction, train_y, ~MLmetrics::Precision(.x,.y, positive = 1))
+  )
+```
+
+```{r}
+best_model <- result %>% 
+  select(modelName, acc, recall, precision, prediction) %>% 
+  unnest(cols = c(acc, recall, precision)) %>% 
+  arrange(desc(acc))
+```
+
+```{r}
+best_model
+```
+
+```{r}
+final_model <- best_model$modelName[1]
+```
+
+
+```{r}
+model_best <- model_fit %>% 
+  filter(modelName == final_model) %>% 
+  pull(modelfits)
+```
+
+```{r eval=FALSE}
+saveRDS(model_best, "best_model.Rds")
+```
+
+
+```{r}
+prediction_test <- predict(model_best[[1]], test_boost)
+```
+
+```{r}
+table(
+  prediction = prediction_test,
+  actual = test_boost$y.yes
+)
+```
+
+```{r}
+test_cm <- confusionMatrix(prediction_test, test_boost$y.yes, positive = "1")
+```
+
+```{r}
+tidy(test_cm) %>% 
+  select(term, estimate) %>% 
+  filter(term %in% c("accuracy", "precision", "recall", "specificity"))
+```
+

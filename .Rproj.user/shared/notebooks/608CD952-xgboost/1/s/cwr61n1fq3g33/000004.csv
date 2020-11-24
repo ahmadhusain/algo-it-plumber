@@ -1,0 +1,4 @@
+"0","library(inspectdf)"
+"0",""
+"0","attrition %>% "
+"0","  inspect_num()"

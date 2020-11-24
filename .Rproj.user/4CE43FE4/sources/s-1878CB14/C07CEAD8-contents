@@ -1,0 +1,288 @@
+---
+title: "Tune XGBoost Model using tidymodels"
+author: "David"
+date: "9/17/2020"
+output:
+  html_document:
+    df_print: paged
+    highlight: tango
+    theme: cosmo
+    toc: yes
+    toc_float:
+      collapsed: no
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      warning = FALSE, 
+                      message = FALSE, fig.width = 8)
+options(scipen = 123)
+```
+
+load libs
+```{r}
+library(tidyverse)
+library(tidymodels)
+theme_set(ggthemes::theme_pander())
+```
+
+
+read data 
+
+```{r}
+attrition <- read_csv("Attrition.csv")
+glimpse(attrition)
+```
+
+
+# EDAA and Data Cleansing
+
+```{r}
+library(inspectdf)
+
+attrition %>% 
+  inspect_num()
+```
+
+- remove `EmployeeNumber` (ID)
+- remove zero variance
+- parse `JobLevel`, `JobInvolvement`, `Education`, `StockOptionLevel` to factor
+```{r}
+library(caret)
+att_clean <- attrition %>% 
+  select(-EmployeeNumber) %>% 
+  select(-nearZeroVar(.)) %>% 
+  mutate_at(vars(JobLevel, JobInvolvement, Education, StockOptionLevel, Attrition), as.factor)
+```
+
+unbalance target class proportion
+```{r}
+att_clean %>% 
+  pull(Attrition) %>% 
+  table() %>% 
+  prop.table() %>% 
+  round(2)
+```
+
+
+```{r}
+att_clean %>% 
+  ggplot(aes(x = Department, fill = Attrition)) +
+  geom_bar(position = "fill") +
+  scale_fill_brewer(palette = "Set1")
+```
+
+
+# Modeling
+
+## Cross Validation
+
+split the data into train and testing data
+
+```{r}
+set.seed(100)
+att_split <- initial_split(data = att_clean, prop = 0.8, strata = "Attrition")
+att_train <- training(att_split)
+att_test <- testing(att_split)
+```
+
+
+## Build Engine Spec
+
+In this section we design the model framework
+
+1. hyperparameter
+
+on the XGBoost method there several hyperparameter than can be tune
+
+- `trees` : number of tree
+- `tree_depth` : kedalaman maksimum setiap tree
+- `min_n` : jumlah data minimal pada node agar node tersebut melakukan split
+- `loss_reduction` : ...
+- `sample_size` : ...
+- `mtry` : ...
+- `learning_rate` : ...
+
+
+2. Engine 
+The packages to be used
+
+3. Mode
+type of method (classification or Regression)
+
+```{r}
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(), 
+  min_n = tune(), 
+  loss_reduction = tune(), 
+  sample_size = tune(), 
+  mtry = tune(), 
+  learn_rate = tune()
+  ) %>% 
+  set_engine("xgboost") %>% 
+  set_mode(mode = "classification")
+```
+
+## Design the Grid
+
+Find the optimum number of parameter using grid search
+
+```{r }
+set.seed(100)
+xgb_grid <-  grid_latin_hypercube(
+  tree_depth(), 
+  min_n(), 
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), att_train) ,  # berapa banyak predictor yang akan digunakan
+  learn_rate(),
+  size = 20
+)
+```
+
+
+## Create Workflow
+
+Pada bagian ini kita menggabungkan beberapa proses supaya bisa dieksekusi secara bersamaan. apa saja yang bisa dimasukkan pada proses ini?
+
+1. `add_recipes` : preprocessing data yang dilakukan dengan menggunakan recipes 
+2. `add_formula` : formula yang akan digunakan
+3. `add_model`   : kerangka dari model yang sudah dibuat
+
+```{r}
+xgb_att <- workflow() %>% 
+  add_formula(Attrition~.) %>% 
+  add_model(xgb_spec)
+  
+```
+
+## Create K-fold
+
+k-fold digunakan untuk mencari hyperparameter yang paling optimum
+
+```{r}
+set.seed(100)
+att_folds <- vfold_cv(att_train, strata = Attrition, v = 10)
+```
+
+
+## Train the Model
+pada  proses ini kita akan melakuakan training menggunakan model yang sudah disiapkan
+1. workflow yang sudah dibuat
+2. fold
+3. grid
+4. control 
+<!-- masih ga tau apaan -->
+5. metrics
+
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(100)
+xgb_res <- tune_grid(
+  object = xgb_att, 
+  resamples = att_folds,
+  grid =  xgb_grid, 
+  control = control_grid(save_pred = TRUE))
+
+```
+
+
+## Model Exploration
+
+ngecek hubungan antara parameter dengan metrics AUC
+```{r}
+xgb_res %>% 
+  collect_metrics() %>% 
+  filter(.metric == "roc_auc") %>% 
+  select(mean, mtry:sample_size) %>% 
+  pivot_longer(mtry:sample_size, 
+               names_to = "param") %>% 
+  ggplot(aes(x = value, y = mean)) +
+  geom_point(aes(col = param), show.legend = F) +
+  facet_wrap(~param, scales = "free_x") +
+  labs(y = "AUC ROC")
+  
+
+```
+
+mengambil top 5 model berdasarkan AUC
+```{r}
+xgb_res %>% 
+  show_best("accuracy")
+
+```
+
+
+mengambil model terbaik yang akan dijadikan sebagai model utama. model terbaik berdasrkan metrics auc
+```{r}
+# ngambil paramewter yang terbaik
+best_auc <- xgb_res %>% 
+  select_best(metric = "roc_auc")
+
+# menggabungkan param ke dalam workflow
+final_xgb <- finalize_workflow(x = xgb_att, best_auc)
+final_xgb
+
+```
+
+
+
+```{r}
+final_model <- final_xgb %>% 
+  fit(att_train)
+
+saveRDS(final_model, "final_model.rds")
+```
+
+
+```{r}
+final_model <- readRDS("final_model.rds")
+```
+
+
+```{r}
+predict(final_model, new_data = )
+```
+
+
+
+```{r eval=F}
+# melakukan final modeling menggunakan full data train
+final_model_all <-  last_fit(final_xgb,att_split)
+# saveRDS(final_model, "final_model.rds")
+```
+
+
+```{r echo=F}
+# final_model <- readRDS("final_model.rds")
+```
+
+
+```{r}
+final_model_all %>% 
+  collect_metrics()
+```
+
+cek confusion matrix
+
+```{r}
+pred_result <-final_model_all %>% 
+  collect_predictions()
+
+pred_result %>% 
+  conf_mat(Attrition, .pred_class) 
+```
+
+
+cek plot ROC
+```{r}
+pred_result %>% 
+  roc_curve(Attrition, .pred_Yes) %>% 
+  autoplot()
+```

@@ -1,0 +1,7 @@
+"0","df_model <- df_model %>% "
+"0","  bind_cols("
+"0","    model_list %>% arrange(modelName)"
+"0","  ) %>% "
+"0","  mutate(id = 1:nrow(.))"
+"0",""
+"0","df_model"

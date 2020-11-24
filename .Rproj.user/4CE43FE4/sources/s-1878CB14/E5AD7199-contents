@@ -1,0 +1,35 @@
+library(tidyverse)
+library(caret)
+library(tidymodels)
+
+attrition <- read.csv("Attrition.csv")
+glimpse(attrition)
+
+
+# stratified random sampling
+
+
+srs_variable <- attrition %>% 
+  select_if(is.factor) %>% 
+  colnames()
+
+library(splitstackshape)
+
+set.seed(100)
+
+srs_attr <- stratified(indt = attrition,
+                       group = srs_variable,
+                       size = 0.8,
+                       bothSets = TRUE)
+attr_train <- srs_attr$SAMP1 # data train 80%
+attr_test <- srs_attr$SAMP2 # data test 20%
+
+# make sure all data is numerical, for Xgboost model.
+
+library(caret)
+
+dmy <- dummyVars(" ~ .", data = attr_train)
+train_boost <- data.frame(predict(dmy, newdata = attr_train))
+
+train_boost <- train_boost %>% select(-y.no) %>% mutate(y.yes = as.factor(y.yes))
+

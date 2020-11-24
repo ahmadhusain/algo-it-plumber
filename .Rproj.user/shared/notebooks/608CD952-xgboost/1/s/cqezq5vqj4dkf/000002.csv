@@ -1,0 +1,4 @@
+"0","set.seed(100)"
+"0","att_split <- initial_split(data = att_clean, prop = 0.8, strata = ""Attrition"")"
+"0","att_train <- training(att_split)"
+"0","att_test <- testing(att_split)"

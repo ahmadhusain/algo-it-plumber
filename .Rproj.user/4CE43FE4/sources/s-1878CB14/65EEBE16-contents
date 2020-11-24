@@ -1,0 +1,1917 @@
+library(lubridate)
+library(tidyverse)
+library(tidyr)
+library(dplyr)
+library(highcharter)
+library(xts)
+library(TTR)
+library(zoo)
+library(quantmod)
+library(scales)
+library(jsonlite)
+library(plumber)
+library(RMariaDB)
+library(sparkline)
+library(formattable)
+library(htmltools)
+
+#* @apiTitle Jarvis Asset Data API
+#* @apiDescription Last updated: 16, August 2020 06:19:07 
+#* @apiVersion 0.0.1
+
+# custom serializers output plumber ---------------------------------------
+
+if (is.null(plumber:::.globals$serializers[["custom_jarvis"]])) {
+  plumber::addSerializer("custom_jarvis", function() {
+    function(val, req, res, errorHandler){
+      tryCatch({
+        data_req <- (req$postBody)
+        # container <- paste0("#", fromJSON(data_req)$id)
+        json <- jsonlite::toJSON(val, force = TRUE, auto_unbox = TRUE, na = "null")
+        res$setHeader("Content-Type", "application/json")
+        res$body <- json 
+        return(res$toResponse())
+      }, error = function(e) {
+        errorHandler(req, res, e)
+      })
+    }
+  })
+}
+
+
+# calculate stocks --------------------------------------------------------
+
+calculate_stocks <- function(data, db, Ticker_name, start_date, end_date){
+  
+  range_year <- (str_extract(start_date, pattern = "[0-9]+") %>% as.numeric()):(str_extract(end_date, pattern = "[0-9]+") %>% as.numeric())
+  
+  # Defined Function
+  auto_select_extra <- function(x,y){
+    x %>% 
+      mutate(Date = ymd(Date),
+             year = year(Date)) %>% 
+      filter(Fields %in% y,
+             year %in% range_year) %>% 
+      select(Fields, Ticker, Date, Value)
+  }
+  
+  rename_variable <- function(data, data_ref){
+    
+    if (is.na(data_ref$Z)) {
+      data <- data %>% 
+        rename(
+          X = data_ref$X, 
+          Y = data_ref$Y 
+        )
+    } else {
+      data <- data %>% 
+        rename(
+          X = data_ref$X, 
+          Y = data_ref$Y, 
+          Z = data_ref$Z 
+        )
+    }
+    
+    return(data)
+  }
+  
+  # Get the data source
+  df_process <- data %>% 
+    mutate_at(vars(Data, Period), tolower) %>% 
+    mutate(
+      Period = tolower(Period),
+      
+      X = case_when(X == "Account Payables" ~ "Account Payable",
+                    TRUE ~ X),
+      Y = case_when(Y == "Account Payables" ~ "Account Payable",
+                    TRUE ~ Y),
+      Z = case_when(Z == "Account Payables" ~ "Account Payable",
+                    TRUE ~ Z),
+      
+      X = ifelse(X == "NA", NA, X),
+      Y = ifelse(Y == "NA", NA, Y),
+      Z = ifelse(Z == "NA", NA, Z),
+      
+      data_source_x = case_when(
+        Type == "Valuation" & ( X %in% c("Enterprise Value", "Market Cap") ) ~ "lv3_px_stocks",
+        Type == "Valuation" & (!( X %in% c("Enterprise Value", "Market Cap") )) ~ "lv3_fs_stocks_annual",
+        TRUE ~ paste("lv3_fs", Data, Period, sep = "_")
+      ),
+      data_source_y = case_when(
+        Type == "Valuation" & ( Y %in% c("Enterprise Value", "Market Cap") ) ~ "lv3_px_stocks",
+        Type == "Valuation" & (!( Y %in% c("Enterprise Value", "Market Cap") )) ~ "lv3_fs_stocks_annual",
+        TRUE ~ paste("lv3_fs", Data, Period, sep = "_")
+      ),
+      data_source_z = case_when(
+        is.na(Z) ~ "NA",
+        Type == "Valuation" & ( Z %in% c("Enterprise Value", "Market Cap") ) ~ "lv3_px_stocks",
+        Type == "Valuation" & (!( Z %in% c("Enterprise Value", "Market Cap") )) ~ "lv3_fs_stocks_annual",
+        TRUE ~ paste("lv3_fs", Data, Period, sep = "_")
+      ) %>% 
+        ifelse(. == "NA", NA, .)
+    )
+  
+  # print(df_process)
+  
+  # Collect data from database
+  ## If column Z is empty
+  if (is.na(df_process$Z)) {
+    df_x <- df_collect <- tbl(db, df_process$data_source_x) %>% 
+      filter(Ticker == Ticker_name) %>% 
+      collect() %>% 
+      auto_select_extra(df_process$X) %>% 
+      filter(Date >= ymd(start_date), 
+             Date <= ymd(end_date)
+      )
+    
+    df_y <- tbl(db, df_process$data_source_y) %>% 
+      filter(Ticker == Ticker_name) %>% 
+      collect() %>% 
+      auto_select_extra(df_process$Y) %>% 
+      filter(Date >= ymd(start_date), 
+             Date <= ymd(end_date)
+      )
+    
+    # Is the period Annual
+    if (df_process$Period == "annual") {
+      df_x <- df_x %>% 
+        mutate(year = year(Date)) 
+      
+      df_y <- df_y %>% 
+        mutate(year = year(Date)) 
+      
+      df_collect <- df_x %>% 
+        bind_rows(df_y) %>%   
+        mutate(Period = "Annual") %>% 
+        select(Fields, Period, Date, year, Value) %>% 
+        group_by(Fields, year) %>% 
+        arrange(desc(Date)) %>% 
+        slice(1) %>% 
+        ungroup() %>% 
+        select(-Date) %>% 
+        pivot_wider(names_from = "Fields", values_from = "Value") 
+      # mutate_if(.predicate = anyNA, .funs = function(x){if_else(is.na(x), 0, as.numeric(x))})
+      
+    } else {
+      df_x <- df_x %>% 
+        mutate(quarter = quarter(Date),
+               year = year(Date)) 
+      
+      df_y <- df_y %>% 
+        mutate(quarter = quarter(Date),
+               year = year(Date)) 
+      
+      df_collect <- df_x %>% 
+        bind_rows(df_y) %>% 
+        mutate(Period = "Quarter") %>% 
+        select(Fields, Period, Date, year, quarter, Value) %>% 
+        group_by(Fields, year, quarter) %>% 
+        arrange(desc(Date)) %>% 
+        slice(1) %>% 
+        ungroup() %>% 
+        select(-Date) %>% 
+        pivot_wider(names_from = "Fields", values_from = "Value")
+      # mutate_if(.predicate = anyNA, .funs = function(x){if_else(is.na(x), 0, as.numeric(x))})
+    }
+  } 
+  
+  ## If column Z is not empty
+  else {
+    df_x <- df_collect <- tbl(db, df_process$data_source_x) %>% 
+      filter(Ticker == Ticker_name) %>% 
+      collect() %>% 
+      auto_select_extra(df_process$X) %>% 
+      filter(Date >= ymd(start_date), 
+             Date <= ymd(end_date)
+      )
+    
+    df_y <- tbl(db, df_process$data_source_y) %>% 
+      filter(Ticker == Ticker_name) %>% 
+      collect() %>% 
+      auto_select_extra(df_process$Y) %>% 
+      filter(Date >= ymd(start_date), 
+             Date <= ymd(end_date)
+      )
+    
+    df_z <- tbl(db, df_process$data_source_z) %>% 
+      filter(Ticker == Ticker_name) %>% 
+      collect() %>% 
+      auto_select_extra(df_process$Z) %>% 
+      filter(Date >= ymd(start_date), 
+             Date <= ymd(end_date)
+      )
+    
+    # Is the period Annual
+    if (df_process$Period == "annual") {
+      df_x <- df_x %>% 
+        mutate(year = year(Date)) 
+      
+      df_y <- df_y %>% 
+        mutate(year = year(Date)) 
+      
+      df_z <- df_z %>% 
+        mutate(year = year(Date)) 
+      
+      df_collect <- df_x %>% 
+        bind_rows(df_y, df_z) %>%   
+        mutate(Period = "Annual") %>% 
+        select(Fields, Period, Date, year, Value) %>% 
+        group_by(Fields, year) %>% 
+        arrange(desc(Date)) %>% 
+        slice(1) %>% 
+        ungroup() %>% 
+        select(-Date) %>% 
+        pivot_wider(names_from = "Fields", values_from = "Value") 
+      # mutate_if(.predicate = anyNA, .funs = function(x){if_else(is.na(x), 0, as.numeric(x))})
+    } else {
+      df_x <- df_x %>% 
+        mutate(quarter = quarter(Date),
+               year = year(Date)) 
+      
+      df_y <- df_y %>% 
+        mutate(quarter = quarter(Date),
+               year = year(Date)) 
+      
+      df_z <- df_z %>% 
+        mutate(quarter = quarter(Date),
+               year = year(Date))
+      
+      df_collect <- df_x %>% 
+        bind_rows(df_y, df_z) %>% 
+        mutate(Period = "Quarter") %>% 
+        select(Fields, Period, Date, year, quarter, Value) %>% 
+        group_by(Fields, year, quarter) %>% 
+        arrange(desc(Date)) %>% 
+        slice(1) %>% 
+        ungroup() %>% 
+        select(-Date) %>% 
+        pivot_wider(names_from = "Fields", values_from = "Value") 
+      # mutate_if(.predicate = anyNA, .funs = function(x){if_else(is.na(x), 0, as.numeric(x))})
+    } 
+  }
+  
+  # print(df_collect)
+  # Calculate Formula
+  if (is.na(df_process$Z)) {
+    output <- df_collect %>% 
+      rename_variable(data_ref = df_process) %>% 
+      mutate( new_col = eval(parse(text = df_process$Formula)) )  %>% 
+      select(-c(X,Y)) %>% 
+      pivot_longer(cols = new_col, names_to =  "Fields", values_to = "Value") %>% 
+      mutate(Fields = df_process$Fields) %>% 
+      arrange(year)
+  } else {
+    output <- df_collect %>% 
+      rename_variable(data_ref = df_process) %>% 
+      mutate( new_col = eval(parse(text = df_process$Formula)) )  %>% 
+      select(-c(X,Y,Z)) %>% 
+      pivot_longer(cols = new_col, names_to =  "Fields", values_to = "Value") %>% 
+      mutate(
+        Fields = df_process$Fields
+      ) %>% 
+      arrange(year)
+  }
+  
+  return(output)
+}
+
+
+
+
+# echo back the input -----------------------------------------------------
+
+#* Echo back the input
+#* @param input input json
+#* @serializer custom_jarvis
+#* @post /echo
+function(req, res, input, signature){
+  
+  fromJSON(req$postBody, flatten = FALSE)
+  
+}
+
+
+# stock card - stock price ---------------------------------------------------
+
+#* Stock Price Chart
+#* @param ticker Ticker Name
+#* @param currency IDR or USD
+#* @param type Chart Type (line, candlestick, area)
+#* @serializer custom_jarvis
+#* @post /stock-card/stockprice
+function(ticker, currency, type, req, res){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+
+  date_flags <- ymd(c("2017-04-17", "2019-08-17"))
+  title_flags <- c("#E1", "#E2")
+  text_flags <- c("An interesting event #1", "An interesting event #2")
+  
+  
+  flags <- data_frame(
+    date = date_flags,
+    title = title_flags,
+    text = text_flags
+  )
+  
+  # usd_idr <- tbl(conn, "lv3_px_currency") %>%
+  #   filter(Ticker == "USD-IDR") %>%
+  #   select(Date, Value) %>%
+  #   collect() %>%
+  #   mutate_at("Date", ymd)
+  
+  
+  data_agg <- readRDS("data/stock_price.RDS")
+  
+  pxstocks_agg <- data_agg %>% filter(Ticker == ticker)
+    # pivot_longer(cols = -c(Date, Ticker), names_to = "Fields", values_to = "Value") %>% 
+    # left_join(usd_idr, by = "Date") %>% 
+    # mutate(Value = case_when(currency == "USD" ~ Value.x/Value.y,
+    #                          TRUE ~ Value.x)) %>% 
+    # select(Ticker, Date, Fields, Value) %>% 
+    # pivot_wider(names_from = Fields, values_from = Value)
+  
+  
+  pxstocks_datviz <- xts(x = pxstocks_agg %>% select(PX.Open, PX.High, PX.Low,
+                                                     PX.Close, Volume, MA, RSI,
+                                                     Upper_Boll, Lower_Boll),
+                         order.by = pxstocks_agg$Date)
+  
+ hc <-  highchart(type = "stock") %>%
+    hc_yAxis_multiples(
+      create_yaxis(3, heights = c(3,1,1), turnopposite = TRUE)
+    ) %>%
+    hc_add_series(pxstocks_datviz, yAxis = 0, id = "stock", name = ticker, type = type) %>%
+    hc_add_series(pxstocks_datviz$MA,  yAxis = 0, name = "MA") %>%
+    hc_add_series(pxstocks_datviz$Upper_Boll,  yAxis = 0, name = "upper") %>%
+    hc_add_series(pxstocks_datviz$Lower_Boll,  yAxis = 0, name = "lower") %>%
+    hc_add_series(flags, hcaes(x = date),
+                  type = "flags", onSeries = "stock") %>%
+    hc_add_series(pxstocks_datviz$Volume, yAxis = 1, name = "Volume", type = "column") %>%
+    hc_add_series(pxstocks_datviz$RSI, yAxis = 2, name = "RSI") %>%
+    hc_tooltip(split = FALSE, shared = TRUE) %>%
+    hc_plotOptions(
+      series = list(
+        fillOpacity = 0.1
+      )
+    ) %>%
+    hc_title(text = paste(fromJSON(data_req) %>% within(rm(signature)), collapse = " | "),
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>%
+    hc_add_theme(hc_theme_monokai()) %>%
+    hc_size(height = 600) %>%
+    hc_rangeSelector(selected = 4)
+
+    temp <- hc$x$hc_opts
+
+    if (signature == computed_request_signature) {
+      res$status <- 200
+      status <- "SUCCESS"
+    } else {
+      res$status <- 400
+      status <- "FAILED"
+    }
+    
+    if (res$status == 400) {
+      list(
+        "code" = res$status,
+        "status" = status,
+        "messages" = "Error: Invalid request",
+        "module" = req$PATH_INFO
+      )
+    } else {
+      list(
+        "code" = res$status,
+        "status" = status,
+        "module" = req$PATH_INFO,
+        "detail" = temp
+        
+    )
+  }
+}
+
+
+# stock card - relative performance ------------------------------------------
+
+#* Relative Performance
+#* @param ticker Ticker Name (ex: ASII)
+#* @param index Index Name (ex: JCI)
+#* @param sector Sector Name (ex: Automotive)
+#* @param field Value (ex: PX Last)
+#* @serializer custom_jarvis
+#* @post /stock-card/relative-performance
+function(ticker, index, sector, field, req, res){
+  
+  # Filter Logging
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  # parameterize
+  
+  get_ticker_rp <- ticker
+  get_index_rp <- index
+  get_sector_rp <- sector
+  get_fields_rp <- field
+
+  
+  # parameterize
+  
+  
+  pxidx_data <-  readRDS(file = "data/pxindex_rp.RDS")
+  
+  stocks_data <- readRDS(file = "data/pxstock_rp.RDS")
+  
+  stock_sector <- readRDS(file = "data/sector_rp.RDS")
+  
+  # data aggregation
+  
+  rp_dat_agg <- stocks_data %>% 
+    filter(Ticker == get_ticker_rp, Fields == get_fields_rp) %>% 
+    select(Date, Value) %>% 
+    rename(!! get_ticker_rp := Value) %>% 
+    left_join(
+      pxidx_data %>% 
+        filter(Ticker == get_index_rp, Fields == get_fields_rp) %>% 
+        select(Date, Value) %>% 
+        rename(!! get_index_rp := Value)
+    ) %>% 
+    left_join(
+      stock_sector %>% 
+        filter(Sector == get_sector_rp, Fields == get_fields_rp) %>% 
+        select(Date, Value) %>% 
+        rename(!! get_sector_rp := Value)
+    ) %>% 
+    filter(complete.cases(.)) %>% 
+    mutate_if(is.numeric, ~round(., digits = 2))
+  
+  # data viz
+  
+  rp_dat_vis <- xts(rp_dat_agg %>% select(-Date) , order.by = rp_dat_agg$Date)
+  
+  # highcharts
+  
+  hc <- highchart(type = "stock") %>% 
+    hc_add_series(rp_dat_vis[,1], name = get_ticker_rp) %>% 
+    hc_add_series(rp_dat_vis[,2], name = get_index_rp) %>% 
+    hc_add_series(rp_dat_vis[,3], name = get_sector_rp) %>% 
+    hc_plotOptions(series = list(compare= 'value', 
+                                 compareStart = FALSE)) %>% 
+    hc_title(text = paste(fromJSON(data_req) %>% within(rm(signature)), collapse = " "),
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>% 
+    hc_tooltip(split = FALSE, shared = TRUE) %>% 
+    hc_yAxis(
+      title = list(text = "Value"),
+      opposite = FALSE
+    ) %>% 
+    hc_add_theme(hc_theme_monokai())
+  
+  temp <- hc$x$hc_opts
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = temp
+      
+    )
+  }
+  
+}
+
+
+# stock card - valuation chart absolute-----------------------------------------------
+
+#* Valuation Chart
+#* @param ticker Ticker Name (ex: BBCA)
+#* @param field Field Name (ex: PE)
+#* @param index Index Name (ex: JCI)
+#* @param range Date Range (1m, 3m, 6m, ytd, or 1y)
+#* @serializer custom_jarvis
+#* @post /stock-card/valuation-chart/absolute
+function(ticker, index, field, range, req, res){
+  
+  # Filter logging
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  
+  
+  ## parameterize
+  
+  input_ticker <- ticker
+  input_fields <- field
+  input_index  <- index
+  input_range <- range
+  
+  ## data aggregation
+  
+  
+  temp <- readRDS(file = "data/abs_valuation.RDS") %>% 
+    filter(Ticker == input_ticker, Fields == input_fields) 
+  
+  last_date <- max(temp$Date)
+  
+  
+  dynamic_date <- switch(
+    input_range,
+    "1m" = last_date - months(1),
+    "3m" = last_date - months(3),
+    "6m" = last_date - months(6),
+    "ytd" =  last_date %>% year() %>% make_date(month = 1, day = 1),
+    "1y" = last_date - years(1)
+  )
+  
+  absolute_agg <- temp %>% 
+    filter(Date >= dynamic_date) %>% 
+    mutate(
+      mean_flat = mean(Value, na.rm = TRUE),
+      upper_bound1 = mean(Value, na.rm = TRUE) + sd(Value, na.rm = TRUE),
+      upper_bound2 = mean(Value, na.rm = TRUE) + 2*sd(Value, na.rm = TRUE), 
+      lower_bound1 = mean(Value, na.rm = TRUE) - sd(Value, na.rm = TRUE), 
+      lower_bound2 = mean(Value, na.rm = TRUE) - 2*sd(Value, na.rm = TRUE)
+    ) %>% 
+    select(-c(Ticker, Fields)) %>% 
+    rename(!! input_fields := Value)
+  
+  
+  ## data vis
+  
+  absolute_vis <- xts(absolute_agg %>% select(-Date), order.by = absolute_agg$Date)
+  
+  ## highcharts
+  
+  absolute <- highchart(type = "stock") %>% 
+    hc_add_series(absolute_vis$PE, name = input_fields) %>% 
+    hc_add_series(absolute_vis$upper_bound1, name = "1std", dashStyle = "shortdash", color = "#ffc000") %>%
+    hc_add_series(absolute_vis$lower_bound1, name = "1std", dashStyle = "shortdash", color = "#ffc000") %>%
+    hc_add_series(absolute_vis$upper_bound2, name = "2std", dashStyle = "longdash", color = "#2b908f") %>%
+    hc_add_series(absolute_vis$lower_bound2, name = "2std", dashStyle = "longdash", color = "#2b908f") %>%
+    hc_add_series(absolute_vis$MA, name = "MA", dashStyle = "shortdash") %>%
+    hc_title(text = paste(fromJSON(data_req) %>% within(rm(signature)), collapse = " | "),
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>% 
+    hc_tooltip(split = FALSE, shared = TRUE) %>% 
+    hc_rangeSelector(
+      list(
+        selected =  4,
+        inputEnabled = FALSE
+      )
+    ) %>% 
+    hc_add_theme(hc_theme_monokai())
+  
+  temp <- absolute$x$hc_opts
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = temp
+      
+    )
+  }
+  
+}
+
+
+# stock card - valuation chart to index -----------------------------------
+
+#* Valuation Chart to index
+#* @param ticker Ticker Name (ex: BBCA)
+#* @param field Field Name (ex: PE)
+#* @param index Index Name (ex: JCI)
+#* @param range Date Range (1m, 3m, 6m, ytd, or 1y)
+#* @serializer custom_jarvis
+#* @post /stock-card/valuation-chart/toindex
+function(ticker, index, field, range, req, res){
+  
+  # Filter logging
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  ## parameterize
+  
+  input_ticker <- ticker
+  input_fields <- field
+  input_index  <- index
+  input_range <- range
+  
+  ## data aggregation
+  
+  
+  conn <- dbConnect(MariaDB(), 
+                    user = "jarvisalgoritma",
+                    password = "Jarvis@2020",
+                    dbname = "jarvis-algoritma",
+                    host = "api.jarvisasset.com")
+  
+  lv4_px_index_valuation <- tbl(conn,"lv4_px_index_valuation") %>% 
+    filter(Ticker %in% input_index, Fields == input_fields)%>% 
+    collect() %>% 
+    select(-1)
+  
+  relative_to_index <- readRDS(file = "data/abs_valuation.RDS") %>% 
+    filter(Fields == input_fields, Ticker == input_ticker) %>% 
+    left_join(lv4_px_index_valuation, by=c("Date")) %>% 
+    filter(Date>="2010-01-01") %>% 
+    mutate(Value = Value.x/Value.y-1) %>% 
+    filter(!is.na(Value)) %>% 
+    select(Date, Value)
+  
+  last_date <- max(relative_to_index$Date)
+  
+  dbDisconnect(conn)
+  
+  dynamic_date <- switch(
+    input_range,
+    "1m" = last_date - months(1),
+    "3m" = last_date - months(3),
+    "6m" = last_date - months(6),
+    "ytd" =  last_date %>% year() %>% make_date(month = 1, day = 1),
+    "1y" = last_date - years(1)
+  )
+  
+  rel_index_agg <- relative_to_index %>% 
+    mutate(
+      MA = rollapplyr(Value, 30, mean, na.rm = TRUE, fill = NA)
+    ) %>% 
+    filter(Date >= dynamic_date) %>% 
+    mutate(
+      mean_flat = mean(Value, na.rm = TRUE),
+      upper_bound1 = mean(Value, na.rm = TRUE) + sd(Value, na.rm = TRUE),
+      upper_bound2 = mean(Value, na.rm = TRUE) + 2*sd(Value, na.rm = TRUE), 
+      lower_bound1 = mean(Value, na.rm = TRUE) - sd(Value, na.rm = TRUE), 
+      lower_bound2 = mean(Value, na.rm = TRUE) - 2*sd(Value, na.rm = TRUE)
+    ) %>% 
+    mutate_if(is.numeric, ~round(., digits = 2))
+  
+  rel_index_davis <- xts(
+    rel_index_agg %>% select(-Date),
+    order.by = rel_index_agg$Date
+  )
+  
+  toindex <- highchart(type = "stock") %>% 
+    hc_add_series(rel_index_davis$Value, type = "line", name = input_ticker) %>% 
+    hc_add_series(rel_index_davis$MA, dashStyle = "shortdash", name = "MA") %>% 
+    hc_add_series(rel_index_davis$upper_bound1, name = "1std", dashStyle = "shortdash", color = "#ffc000", opacity = 0.25) %>%
+    hc_add_series(rel_index_davis$lower_bound1, name = "1std", dashStyle = "shortdash", color = "#ffc000") %>%
+    hc_add_series(rel_index_davis$upper_bound2, name = "2std", dashStyle = "longdash", color = "#2b908f") %>%
+    hc_add_series(rel_index_davis$lower_bound2, name = "2std", dashStyle = "longdash", color = "#2b908f") %>%
+    hc_title(text = paste("Relative to Index",paste(fromJSON(data_req) %>% within(rm(signature)), collapse = " | ")),
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>% 
+    hc_tooltip(split = FALSE, shared = TRUE) %>% 
+    hc_rangeSelector(
+      list(
+        selected =  4,
+        inputEnabled = FALSE)
+    ) %>%  
+    hc_add_theme(hc_theme_monokai())
+
+  temp <- toindex$x$hc_opts
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = temp
+      
+    )
+  }
+  
+}
+
+# stock card - stock Information -------------------------------------------------------
+#* Stock Information
+#* @param ticker Ticker Name
+#* @param lastdate (Ex: "2020-06-25")
+#* @serializer custom_jarvis
+#* @post /stock-card/stock-information
+function(ticker, lastdate, req, res){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  input_ticker <- ticker
+  
+  stock_info <- readRDS("data/stock-info-agg.RDS")
+  
+  filter_year <- Sys.Date() %>% year()
+  
+  conn <- dbConnect(MariaDB(), 
+                    user = "jarvisalgoritma",
+                    password = "Jarvis@2020",
+                    dbname = "jarvis-algoritma",
+                    host = "api.jarvisasset.com")
+  
+  pxstocksweight_data <- tbl(conn, "lv4_px_stocks_weight") %>% 
+    filter(Ticker == input_ticker, Date == lastdate) %>% 
+    select(Ticker, Indices, Fields, Value) %>% 
+    collect()
+  pxstocksval_data <- tbl(conn, "lv4_px_stocks_valuation") %>% 
+    filter(Ticker == input_ticker, Date == lastdate) %>%
+    select(Ticker, Fields, Value) %>% 
+    collect()
+  
+  dbDisconnect(conn)
+  
+  out <- stock_info %>% 
+    filter(Ticker == input_ticker) %>% 
+    mutate_if(is.numeric, scales::dollar_format(prefix = NULL)) %>% 
+    select(Fields, Value) %>% 
+    rename(!! input_ticker := Fields) %>% 
+    bind_rows(
+      pxstocksval_data %>% 
+        mutate_if(is.numeric, scales::dollar_format(prefix = NULL)) %>% 
+        select(Fields, Value) %>% 
+        rename(!! input_ticker := Fields)
+    ) %>% 
+    bind_rows(
+      pxstocksweight_data %>% 
+        mutate_if(is.numeric, scales::dollar_format(prefix = NULL)) %>% 
+        mutate(Fields = paste(Indices, Fields, sep = " | ")) %>% 
+        select(Fields, Value) %>% 
+        rename(!! input_ticker := Fields)
+    )
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = out
+      
+    )
+  }
+  
+}
+# stock card - earning seasonality ----------------------------------------
+#* Stock card - Earning Seasonality
+#* @param ticker Ticker Name
+#* @param fields Revenue
+#* @serializer custom_jarvis
+#* @post /stock-card/earning-seasonality
+function(ticker, fields, req, res){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  # parameterize
+  
+  get_ticker_es <- ticker
+  get_fields_es <- fields
+  
+  # get data
+  
+  conn <- dbConnect(MariaDB(), 
+                    user = "jarvisalgoritma",
+                    password = "Jarvis@2020",
+                    dbname = "jarvis-algoritma",
+                    host = "api.jarvisasset.com")
+  
+  stock_annual_data <- tbl(conn, "lv3_fs_stocks_annual") %>% 
+    filter(Ticker == get_ticker_es, Fields == get_fields_es) %>%
+    collect()
+  
+  stock_quarter_data <- tbl(conn, "lv3_fs_stocks_quarter") %>% 
+    filter(Ticker == get_ticker_es, Fields == get_fields_es) %>%
+    collect()
+  
+  
+  dbDisconnect(conn)
+  # data aggregation & vis
+  
+  stock_quarter_vis <- stock_quarter_data %>% 
+    mutate(year = year(ymd(Date))) %>% 
+    group_by(year) %>% 
+    mutate(quarter = quarter(ymd(Date)),
+           quarter = paste0(Period, quarter),
+           percentage = (Value / sum(Value)) %>% round(., 2),
+           label = scales::percent(percentage)) %>% 
+    ungroup() %>% 
+    select(year, quarter, percentage, label) %>% 
+    na.omit() %>% 
+    mutate(
+      year = as.factor(year),
+      quarter = as.factor(quarter)
+    )
+  
+  # highcharts
+  
+  mean_dynamic <- JS("  var addAvgLine = function(axis) {
+    var points = axis.series[0].points,
+      point = {},
+      i = 0,
+      total = 0,
+      avgLength = 0,
+      avg = 0,
+      len = points.length;
+    for (i = 0; i < len; i++) {
+      point = points[i];
+      if (point.isInside) {
+        total += point.y;
+        avgLength++;
+      }
+    }
+    avg = (total / avgLength).toFixed(6)
+    //try
+    axis.chart.get('yA0').removePlotLine('avg');
+    axis.chart.get('yA0').addPlotLine({
+      id: 'avg',
+      value: avg,
+      color: 'red',
+      dashStyle: 'dash',
+      width: 1,
+      label: {
+        text: avg
+      },
+      zIndex: 4
+    });
+  }")
+  
+  hc <- highchart() %>% 
+    hc_add_series(stock_quarter_vis,
+                  type = "line",
+                  mapping = hcaes(x = quarter, y = percentage, group = year),
+                  showinLegend = FALSE) %>% 
+    hc_tooltip(pointFormat = "Year: {point.year} <br> 
+                            Percentage: {point.label}") %>%
+    hc_xAxis(categories = stock_quarter_vis$quarter) %>% 
+    hc_plotOptions(
+      series = list(
+        events = list(
+          mouseOver = JS("function() { if(this.options.color !== '#c00000') {this.update({color: '#c00000'})} }"),
+          mouseOut = JS("function() { if(this.options.color === '#c00000') {this.update({color: '#d8d8d8'})} }")
+        ),
+        states = list(
+          hover = list(
+            enabled = TRUE,
+            lineWidth = 8
+          )
+        )
+      )) %>% 
+    hc_colors("#d8d8d8") %>% 
+    hc_title(text = paste("Earning Seasonality", ticker, fields, collapse = " | "),
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>% 
+    hc_legend(enabled = FALSE) %>% 
+    hc_add_theme(hc_theme_monokai())
+  
+  temp <- hc$x$hc_opts
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = temp
+      
+    )
+  }
+  
+}
+# stock card - force tables -----------------------------------------------
+#* Stock Card - Force Table
+#* @param ticker Ticker name
+#* @param fields Value
+#* @serializer custom_jarvis
+#* @post /stock-card/force-table
+function(ticker, fields, req, res){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  input_ticker <- ticker
+  input_fields <- fields
+  
+  conn <- dbConnect(MariaDB(), 
+                    user = "jarvisalgoritma",
+                    password = "Jarvis@2020",
+                    dbname = "jarvis-algoritma",
+                    host = "api.jarvisasset.com")
+  
+  flowksei_data <- tbl(conn, "lv3_flow_ksei") %>% 
+    filter(Ticker==input_ticker & Fields==input_fields) %>% 
+    collect()
+  
+  dbDisconnect(conn)
+  
+  # data aggregation
+  
+  flowksei_agg <- flowksei_data %>%
+    select(-ID_Unique) %>%
+    mutate_at("Date", ymd) %>% 
+    filter(Date >= floor_date(max(Date), "month") - months(6)) %>% 
+    mutate(Date = as.character(format(Date, "%b %Y"))) %>% 
+    spread(Date, Value) %>%
+    select(-c(Ticker, Type, Fields))
+  
+  sparkline_data <- flowksei_agg %>% 
+    gather(Date, value, -Shareholder) %>%
+    group_by(Shareholder) %>%
+    summarize(
+      TrendSparkline = spk_chr(
+        value, type ="line"
+      )
+    )
+  
+  # output table
+  
+  
+  flowksei_vis <- flowksei_agg %>% 
+    mutate_if(is.numeric, 
+              ~dollar_format(accuracy = 0.1, 
+                             scale = 10^-9, 
+                             prefix = NULL,
+                             suffix = " B")(.)) %>% 
+    left_join(sparkline_data)
+  
+  table_out <- flowksei_vis %>% 
+    format_table() %>% 
+    htmltools::HTML() %>% 
+    div() %>% 
+    spk_add_deps()
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = flowksei_vis
+      
+    )
+  }
+  
+}
+
+# stock card - force charts -----------------------------------------------
+#* Stock Card Force Chart
+#* @param ticker Ticker Name
+#* @serializer custom_jarvis
+#* @post /stock-card/force-charts
+function(ticker, res, req){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  get_ticker_force <- ticker
+  
+  rules <- data.frame(shareholder = c("Foreign.Fund", "Local.MF", "Local.IS,Local.PF"),
+                      Indices = c("MSCI,MSCI Small Cap", "JCI,Universe", "LQ45,IDX30"))
+  
+  get_rules <- 3
+  
+  get_indices <- function(){
+    rules[get_rules,2] %>% 
+      as.character() %>%
+      strsplit(",") %>%
+      unlist()
+  }
+  
+  get_shareholder <- function(){
+    rules[get_rules,1] %>% 
+      as.character() %>%
+      strsplit(",") %>%
+      unlist()
+  }
+  
+  ## get data
+  
+  conn <- dbConnect(MariaDB(), 
+                    user = "jarvisalgoritma",
+                    password = "Jarvis@2020",
+                    dbname = "jarvis-algoritma",
+                    host = "api.jarvisasset.com")
+  
+  market_cap <- tbl(conn, "lv3_px_index") %>% 
+    filter(Ticker == get_ticker_force, Fields == "Market Cap") %>%
+    collect() %>% 
+    group_by(year = year(ymd(Date)), month = month(ymd(Date))) %>% 
+    filter(Date == max(ymd(Date))) %>% 
+    mutate(Date = floor_date(ymd(Date), unit = "month") + months(1) - days(1)) %>% 
+    ungroup() %>% 
+    select(Date, `Market Cap` = Value)
+  
+  ownership <- tbl(conn, "lv4_px_index_ownership") %>% 
+    filter(Indices == get_ticker_force, Fields == "Ownership Value", Shareholder %in% local(get_shareholder())) %>% 
+    select(Date, `Ownership Value` = Value) %>% 
+    collect()
+  
+  dbDisconnect(conn)
+  
+  ## data agg
+  
+  dat_agg <- ownership %>% 
+    mutate_at("Date", ymd) %>% 
+    left_join(market_cap, by = "Date") %>% 
+    distinct(Date, .keep_all = TRUE) %>% 
+    mutate_at("Date", ymd)
+  
+  ## data vis
+  
+  dat_vis <- xts(dat_agg %>% select(-Date), order.by = dat_agg$Date)
+  
+  ## highcharts
+  
+  hc <- highchart(type = "stock") %>% 
+    hc_yAxis_multiples(
+      list(lineWidth = 3),
+      list(showLastLabel = FALSE, opposite = FALSE)
+    ) %>% 
+    hc_add_series(data = dat_vis$`Ownership Value`, name = "Ownership") %>% 
+    hc_add_series(data = dat_vis$`Market Cap`, yAxis = 1, name = "Market Cap") %>% 
+    hc_title(text = paste("Force Chart", fromJSON(data_req) %>% within(rm(signature)) %>% paste()),
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>% 
+    hc_tooltip(split = FALSE, shared = TRUE) %>% 
+    hc_add_theme(hc_theme_monokai())
+  
+  temp <- hc$x$hc_opts
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = temp
+      
+    )
+  }
+  
+}
+
+# scoring - technical indikators MACD ------------------------------------------
+
+#* Technical Indicator MACD
+#* @param ticker Ticker Name
+#* @param n_fast short moving average
+#* @param n_slow fast moving average
+#* @param n_signal signal line
+#* @serializer custom_jarvis
+#* @post /scoring/macd
+function(ticker, n_fast, n_slow, n_signal, res, req){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  # parameterize
+  
+  get_ticker <- ticker
+
+  # custom function
+  
+  macd_func <- function (price,fast,slow,signal){
+    MA_fast <- EMA(price, fast)
+    MA_slow <- EMA(price, slow)
+    MACD <- MA_fast - MA_slow
+    signal <- EMA(MACD, signal)
+    output <- cbind(MA_fast, MA_slow, MACD, signal)
+    colnames(output) <- c(paste0("MA",fast), paste0("MA", slow), "MACD","signal")
+    output <- as_tibble(output)
+    return(output)
+  }
+  
+  
+  # get data
+  
+  data_agg <- readRDS("data/stock_price.RDS")
+  
+  
+  # data aggregation
+  
+  pxstocks_agg <- data_agg %>% 
+    filter(Ticker == "ASII") %>% 
+    bind_cols(
+      macd_func(price = .$PX.Close, fast = n_fast, slow = n_slow, signal = n_signal)
+    ) %>% 
+    select(Ticker, Date, PX.Close, MACD, signal) %>% 
+    na.omit()
+  
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = pxstocks_agg
+      
+    )
+  }
+  
+}
+
+
+# scoring - growth ranking ------------------------------------------------
+
+#* Scoring Growth Ranking
+#* @param grouping
+#* @param type
+#* @param field
+#* @serializer custom_jarvis
+#* @post /scoring/ranking
+function(grouping, type, field, res, req){
+  
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  stock_absolute_table <- readRDS(file = "data/stock_table.RDS")
+  FS.Sector.Growth.Q <- readRDS( file = "data/sector_q.RDS")
+  FS.Sector.Growth.A <- readRDS(file = "data/sector_a.RDS")
+  stock_absolute_long <- readRDS( file = "data/stock_abs.RDS")
+  stock_class_long <- readRDS(file = "data/stock_class.RDS")
+  
+    temp_out <- FS.Sector.Growth.A %>% 
+      select(-ID_Unique) %>% 
+      filter(year(Date) == "2018") %>% 
+      arrange(desc(Value)) %>% 
+      group_by(Grouping, Fields, Growth) %>% 
+      mutate(
+        `Ranking Grouping` = dense_rank(desc(Value))
+      ) %>% 
+      ungroup() %>%
+      arrange(Fields, `Ranking Grouping`) %>%  
+      filter(Grouping == grouping) %>% 
+      rename(!! grouping := Ticker) %>% 
+      select(-Value) %>% 
+      left_join(
+        select(stock_absolute_long, Ticker, !! grouping, Fields, Date, Growth, Value)
+      ) %>% 
+      group_by(.dots = grouping, Fields, Growth) %>%
+      mutate(
+        `Ranking Stock` = dense_rank(desc(Value))
+      ) %>%
+      ungroup() %>%
+      # select(-Value) %>% 
+      left_join(
+        select(stock_class_long, Ticker, !! grouping, Fields, Date, Growth, Class)
+      ) %>% 
+      mutate(
+        Scoring = case_when(
+          Class == "Turning Profit" ~ 1000,
+          Class == "Low Base" ~ 2000,
+          Class == "Normal" ~ 3000,
+          Class == "Smaller Loss" ~ 4000,
+          Class == "Bigger Loss" ~ 5000,
+          Class == "Turning Loss" ~ 6000
+        )
+      ) %>% 
+      group_by(
+        Class, Growth
+      ) %>% 
+      mutate(
+        `Adj Rank` = dense_rank(desc(Value))
+      ) %>% 
+      ungroup() %>% 
+      mutate(
+        `Ranking Stock` = case_when(
+          Class == "Normal" ~ Scoring + `Adj Rank`,
+          TRUE ~ Scoring 
+        )
+      ) %>% 
+      arrange(`Ranking Stock`)
+    
+    out <- temp_out %>% 
+      filter(Fields == field, Growth == type) %>% 
+      select(Ticker, !! grouping, Fields, Growth, `Ranking Grouping`, `Ranking Stock`) %>% 
+      `colnames<-`(names(.) %>% str_replace_all(., pattern = " ", replacement = "_"))
+    
+    
+    if (signature == computed_request_signature) {
+      res$status <- 200
+      status <- "SUCCESS"
+    } else {
+      res$status <- 400
+      status <- "FAILED"
+    }
+    
+    if (res$status == 400) {
+      list(
+        "code" = res$status,
+        "status" = status,
+        "messages" = "Error: Invalid request",
+        "module" = req$PATH_INFO
+      )
+    } else {
+      list(
+        "code" = res$status,
+        "status" = status,
+        "module" = req$PATH_INFO,
+        "detail" = out
+        
+      )
+    }
+  
+}
+
+
+# scoring - stock growth --------------------------------------------------
+
+#* Scoring Stock Growth
+#* @serializer custom_jarvis
+#* @post /scoring/stock-growth
+function(ticker, res, req){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  stock_absolute_table <- readRDS(file = "data/stock_table.RDS") %>%
+    filter(Ticker == ticker)
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = stock_absolute_table
+      
+    )
+  }
+  
+}
+
+
+# scoring - technical -----------------------------------------------------
+
+#* Scoring technical
+#* @param ticker Input multiple ticker
+#* @serializer custom_jarvis
+#* @post /scoring/technical
+function(ticker, req, res){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  scoring_technical <- readRDS("data/scoring-technical.RDS")
+
+  out <- scoring_technical %>% 
+    filter(Ticker %in% ticker)
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = out
+      
+    )
+  }
+  
+}
+
+
+# Financial Model -------------------------------------------------
+#* Financial Model
+#* @param type (Ex: Macro Assumption, Capital Adequacy, Balance Sheet Ratio, Non Interest Income)
+#* @serializer custom_jarvis
+#* @post /financial-model
+function(type, res, req){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  financial_model <- readRDS(file = "data/financial_model.Rds")
+  
+  out <- financial_model[[type]]
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = out
+      
+    )
+  }
+  
+}
+
+# Forecast PE
+#* Forecast PE
+#* @serializer custom_jarvis
+#* @post /forecast-pe
+function(res, req){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  hc <- readRDS("data/forecast_pe.Rds")
+  
+  temp <- hc$x$hc_opts
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = temp
+      
+    )
+  }
+  
+}
+# Market Analysis Flow by Shareholder ---------------------------------------------------------
+#* Market Analysis Flow by Shareholder
+#* @param ticker Ticker Name
+#* @param fields
+#* @serializer custom_jarvis
+#* @post /market-analysis/flow
+function(ticker, fields, req, res){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  input_ticker <- ticker
+  input_field <- fields
+  
+  list_shareholder <- c("Foreign.IF", "Foreign.PF", 
+                        "Foreign.IS", 
+                        "FOreign.MF", "Local.IS",
+                        "Local.PF", "Local.MF",
+                        "Local.ID", "Foreign.ID")
+
+  # data aggregation
+  
+  stock_agg <- readRDS("data/stock_market_analysis_agg.RDS") %>% 
+    filter(Ticker==input_ticker, Fields == input_field) %>% 
+    select(c(Date, Price))
+
+  
+  stock_ownership_agg <- readRDS("data/stock_own_agg.RDS") %>%
+    filter(Ticker == input_ticker) %>% 
+    left_join(stock_agg) %>% 
+    select(-c(Ticker))
+  
+  # data vis
+  
+  data_vis <- xts(stock_ownership_agg %>% select(-Date), 
+                  order.by = stock_ownership_agg$Date )
+  
+  # highcharts
+  
+ hc <-  highchart(type = "stock") %>% 
+    hc_yAxis_multiples(
+      list(lineWidth = 1),
+      list(opposite = FALSE)
+    ) %>% 
+    hc_plotOptions(column = list(stacking = "normal")) %>%
+    hc_xAxis(
+      categories = data_vis$Date
+    ) %>% 
+    hc_add_series(
+      data = data_vis$`Foreign Fund`,
+      name = "Foreign Fund",
+      type = "column"
+    ) %>% 
+    hc_add_series(
+      data = data_vis$Insurance,
+      name = "Insurance",
+      type = "column"
+    ) %>% 
+    hc_add_series(
+      data = data_vis$`Foreign Mutual Fund`,
+      name = "Foreign Mutial Fund",
+      type = "column"
+    ) %>% 
+    hc_add_series(
+      data = data_vis$Retail,
+      name = "Retail",
+      color = "orange",
+      type = "column"
+    ) %>% 
+    hc_add_series(
+      data = data_vis$Price,
+      name = "Stock Price",
+      type = "line",
+      yAxis = 1
+    ) %>% 
+    hc_title(text = paste("Flow by Shareholder |", paste(fromJSON(data_req) %>% within(rm(signature)), collapse = " | ")),
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>% 
+    hc_tooltip(split = FALSE, shared = TRUE) %>% 
+    hc_add_theme(hc_theme_monokai())
+ 
+ temp <- hc$x$hc_opts
+ 
+ 
+ if (signature == computed_request_signature) {
+   res$status <- 200
+   status <- "SUCCESS"
+ } else {
+   res$status <- 400
+   status <- "FAILED"
+ }
+ 
+ if (res$status == 400) {
+   list(
+     "code" = res$status,
+     "status" = status,
+     "messages" = "Error: Invalid request",
+     "module" = req$PATH_INFO
+   )
+ } else {
+   list(
+     "code" = res$status,
+     "status" = status,
+     "module" = req$PATH_INFO,
+     "detail" = temp
+     
+   )
+ }
+  
+}
+
+# Market Analysis - Fund Cash Level ---------------------------------------
+#* Market Analysis - Fund Cash Level
+#* @param ticker Ticker Name
+#* @serializer custom_jarvis
+#* @post /market-analysis/cash
+function(ticker, req, res){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  input_ticker <- ticker
+  
+  data_agg <- readRDS("data/fund_cash_agg.RDS") %>% 
+    filter(Ticker == input_ticker) %>% 
+    select(Date, Price, `Cash Level`)
+  
+  # data vis
+  
+  data_vis <- xts(data_agg %>%  select(-Date), order.by = data_agg$Date)
+
+  hc <- highchart(type = "stock") %>% 
+    hc_yAxis_multiples(
+      list(lineWidth = 1),
+      list(opposite = FALSE)
+    ) %>% 
+    hc_add_series(data_vis$`Cash Level`, name = "Cash Level", yAxis = 1) %>%
+    hc_add_series(data_vis$Price, name = paste0("Stock Price | ", input_ticker)) %>% 
+    hc_title(text = paste("Fund Cash Level", input_ticker),
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>% 
+    hc_tooltip(split = FALSE, shared = TRUE) %>% 
+    hc_add_theme(hc_theme_monokai())
+  
+  temp <- hc$x$hc_opts
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = temp
+      
+    )
+  }
+  
+}
+
+# Stock Ratio -------------------------------------------------------------
+
+#* Stock Ratio
+#* @param ticker
+#* @param startyear Start from 2010
+#* @param endyear 
+#* @param field (Ex: PE, PBV, PS, EV/EBITDA)
+#* @param period (Ex: Annual or Quarter)
+#* @serializer custom_jarvis
+#* @post /stock-ratio
+function(ticker, startyear, endyear, field, period, res, req){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  stock_ratio <- readRDS("data/stock-ratio.RDS")
+  
+  input_ticker <- ticker
+  input_startyear <- startyear
+  input_endyear <- endyear
+  input_field <- field
+  input_period <- period
+  
+  out <- stock_ratio %>% 
+    filter(Ticker %in% input_ticker,
+           year(Date) >= input_startyear,
+           year(Date) <= input_endyear,
+           Fields == input_field,
+           Period == input_period)
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = out
+      
+    )
+  }
+  
+}
+
+
+# scoring fundamental -----------------------------------------------------
+#* Scoring Fundamental
+#* @param ticker Ticker name
+#* @param start_year Start Year
+#* @param end_year End Year
+#* @param nf_model 
+#* @param earning_sensitivity
+#* @param stock_ratio
+#* @serializer custom_jarvis
+#* @post /scoring/fundamental
+function(ticker, start_year, end_year, nf_model, earning_sensitivity, stock_ratio = NULL){
+  
+}
+# scoring NF Model --------------------------------------------------------
+#* Scoring NF ModelO
+#* @param ticker Ticker Name
+#* @param year_back
+#* @param currency
+#* @param unit_scale
+#* @param user
+#* @param file_assumption
+#* @serializer custom_jarvis
+#* @post /scoring/nf-model
+function(ticker, year_back, currency, unit_scale, user, file_assumption){
+  
+}
+# Market Monitor ----------------------------------------------------------
+#* Market Monitor Sparkline
+#* @serializer custom_jarvis
+#* @post /market-monitor
+function(res,req){
+  
+  data_req <- (req$postBody)
+  signature <- fromJSON(data_req)$signature
+  
+  salt <- "algojarvis"
+  
+  base_string <- paste0(paste(fromJSON(data_req) %>% within(rm(signature)), collapse = ""), salt)
+  
+  computed_request_signature <- openssl::sha1(base_string)
+  
+  market_monitor <- readRDS(file = "data/market_monitor.Rds")
+  
+  if (signature == computed_request_signature) {
+    res$status <- 200
+    status <- "SUCCESS"
+  } else {
+    res$status <- 400
+    status <- "FAILED"
+  }
+  
+  if (res$status == 400) {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "messages" = "Error: Invalid request",
+      "module" = req$PATH_INFO
+    )
+  } else {
+    list(
+      "code" = res$status,
+      "status" = status,
+      "module" = req$PATH_INFO,
+      "detail" = market_monitor
+      
+    )
+  }
+  
+}

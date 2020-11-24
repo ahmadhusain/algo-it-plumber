@@ -1,0 +1,4 @@
+"0","final_model <- final_xgb %>% "
+"0","  fit(att_train)"
+"0",""
+"0","saveRDS(final_model, ""final_model.rds"")"

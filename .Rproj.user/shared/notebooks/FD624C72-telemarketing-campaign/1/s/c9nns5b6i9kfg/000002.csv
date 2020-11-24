@@ -1,0 +1,8 @@
+"0","# make sure all data is numerical, for Xgboost model."
+"0",""
+"0","library(caret)"
+"0",""
+"0","dmy <- dummyVars("" ~ ."", data = bank_train)"
+"0","train_boost <- data.frame(predict(dmy, newdata = bank_train))"
+"0",""
+"0","train_boost <- train_boost %>% select(-y.no) %>% mutate(y.yes = as.factor(y.yes))"

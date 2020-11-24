@@ -1,0 +1,22 @@
+library(plumber)
+library(tidyverse)
+library(tidymodels)
+library(jsonlite)
+
+#* @apiTitle Internal training
+
+
+#* Prediksi data baru
+#* @post /api-predict
+function(req) {
+  df <- fromJSON(req$postBody) %>% as_tibble()
+  
+  final_model <- readRDS("final_model.rds")
+  
+  predict(model_logit, df)
+}
+
+
+
+hehe <- att_test %>% 
+  mutate_if(is.character, as.factor)

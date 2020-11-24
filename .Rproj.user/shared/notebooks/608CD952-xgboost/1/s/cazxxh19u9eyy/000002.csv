@@ -1,0 +1,4 @@
+"0","xgb_att <- workflow() %>% "
+"0","  add_formula(Attrition~.) %>% "
+"0","  add_model(xgb_spec)"
+"0","  "

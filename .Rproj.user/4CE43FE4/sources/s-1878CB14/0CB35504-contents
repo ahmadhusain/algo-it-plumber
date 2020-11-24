@@ -1,0 +1,1283 @@
+
+
+library(lubridate)
+library(tidyverse)
+library(highcharter)
+library(xts)
+library(TTR)
+library(zoo)
+library(quantmod)
+library(scales)
+library(jsonlite)
+library(plumber)
+library(RMariaDB)
+
+
+# custom serializers output plumber ---------------------------------------
+
+if (is.null(plumber:::.globals$serializers[["custom_jarvis"]])) {
+  plumber::addSerializer("custom_jarvis", function() {
+    function(val, req, res, errorHandler){
+      tryCatch({
+        data_req <- (req$postBody)
+        container <- paste0("#", fromJSON(data_req)$id)
+        json <- jsonlite::toJSON(val, force = TRUE, auto_unbox = TRUE)
+        
+        json_out <- sprintf("$(function(){\n\t$('%s').highcharts(\n%s\n);\n});", container, json)
+        res$setHeader("Content-Type", "application/json")
+        res$body <- json_out 
+        
+        return(res$toResponse())
+      }, error = function(e) {
+        errorHandler(req, res, e)
+      })
+    }
+  })
+}
+
+
+# calculate stocks --------------------------------------------------------
+
+calculate_stocks <- function(data, db, Ticker_name, start_date, end_date){
+  
+  range_year <- (str_extract(start_date, pattern = "[0-9]+") %>% as.numeric()):(str_extract(end_date, pattern = "[0-9]+") %>% as.numeric())
+  
+  # Defined Function
+  auto_select_extra <- function(x,y){
+    x %>% 
+      mutate(Date = ymd(Date),
+             year = year(Date)) %>% 
+      filter(Fields %in% y,
+             year %in% range_year) %>% 
+      select(Fields, Ticker, Date, Value)
+  }
+  
+  rename_variable <- function(data, data_ref){
+    
+    if (is.na(data_ref$Z)) {
+      data <- data %>% 
+        rename(
+          X = data_ref$X, 
+          Y = data_ref$Y 
+        )
+    } else {
+      data <- data %>% 
+        rename(
+          X = data_ref$X, 
+          Y = data_ref$Y, 
+          Z = data_ref$Z 
+        )
+    }
+    
+    return(data)
+  }
+  
+  # Get the data source
+  df_process <- data %>% 
+    mutate_at(vars(Data, Period), tolower) %>% 
+    mutate(
+      Period = tolower(Period),
+      
+      X = case_when(X == "Account Payables" ~ "Account Payable",
+                    TRUE ~ X),
+      Y = case_when(Y == "Account Payables" ~ "Account Payable",
+                    TRUE ~ Y),
+      Z = case_when(Z == "Account Payables" ~ "Account Payable",
+                    TRUE ~ Z),
+      
+      X = ifelse(X == "NA", NA, X),
+      Y = ifelse(Y == "NA", NA, Y),
+      Z = ifelse(Z == "NA", NA, Z),
+      
+      data_source_x = case_when(
+        Type == "Valuation" & ( X %in% c("Enterprise Value", "Market Cap") ) ~ "lv3_px_stocks",
+        Type == "Valuation" & (!( X %in% c("Enterprise Value", "Market Cap") )) ~ "lv3_fs_stocks_annual",
+        TRUE ~ paste("lv3_fs", Data, Period, sep = "_")
+      ),
+      data_source_y = case_when(
+        Type == "Valuation" & ( Y %in% c("Enterprise Value", "Market Cap") ) ~ "lv3_px_stocks",
+        Type == "Valuation" & (!( Y %in% c("Enterprise Value", "Market Cap") )) ~ "lv3_fs_stocks_annual",
+        TRUE ~ paste("lv3_fs", Data, Period, sep = "_")
+      ),
+      data_source_z = case_when(
+        is.na(Z) ~ "NA",
+        Type == "Valuation" & ( Z %in% c("Enterprise Value", "Market Cap") ) ~ "lv3_px_stocks",
+        Type == "Valuation" & (!( Z %in% c("Enterprise Value", "Market Cap") )) ~ "lv3_fs_stocks_annual",
+        TRUE ~ paste("lv3_fs", Data, Period, sep = "_")
+      ) %>% 
+        ifelse(. == "NA", NA, .)
+    )
+  
+  # print(df_process)
+  
+  # Collect data from database
+  ## If column Z is empty
+  if (is.na(df_process$Z)) {
+    df_x <- df_collect <- tbl(db, df_process$data_source_x) %>% 
+      filter(Ticker == Ticker_name) %>% 
+      collect() %>% 
+      auto_select_extra(df_process$X) %>% 
+      filter(Date >= ymd(start_date), 
+             Date <= ymd(end_date)
+      )
+    
+    df_y <- tbl(db, df_process$data_source_y) %>% 
+      filter(Ticker == Ticker_name) %>% 
+      collect() %>% 
+      auto_select_extra(df_process$Y) %>% 
+      filter(Date >= ymd(start_date), 
+             Date <= ymd(end_date)
+      )
+    
+    # Is the period Annual
+    if (df_process$Period == "annual") {
+      df_x <- df_x %>% 
+        mutate(year = year(Date)) 
+      
+      df_y <- df_y %>% 
+        mutate(year = year(Date)) 
+      
+      df_collect <- df_x %>% 
+        bind_rows(df_y) %>%   
+        mutate(Period = "Annual") %>% 
+        select(Fields, Period, Date, year, Value) %>% 
+        group_by(Fields, year) %>% 
+        arrange(desc(Date)) %>% 
+        slice(1) %>% 
+        ungroup() %>% 
+        select(-Date) %>% 
+        pivot_wider(names_from = "Fields", values_from = "Value") 
+      # mutate_if(.predicate = anyNA, .funs = function(x){if_else(is.na(x), 0, as.numeric(x))})
+      
+    } else {
+      df_x <- df_x %>% 
+        mutate(quarter = quarter(Date),
+               year = year(Date)) 
+      
+      df_y <- df_y %>% 
+        mutate(quarter = quarter(Date),
+               year = year(Date)) 
+      
+      df_collect <- df_x %>% 
+        bind_rows(df_y) %>% 
+        mutate(Period = "Quarter") %>% 
+        select(Fields, Period, Date, year, quarter, Value) %>% 
+        group_by(Fields, year, quarter) %>% 
+        arrange(desc(Date)) %>% 
+        slice(1) %>% 
+        ungroup() %>% 
+        select(-Date) %>% 
+        pivot_wider(names_from = "Fields", values_from = "Value")
+      # mutate_if(.predicate = anyNA, .funs = function(x){if_else(is.na(x), 0, as.numeric(x))})
+    }
+  } 
+  
+  ## If column Z is not empty
+  else {
+    df_x <- df_collect <- tbl(db, df_process$data_source_x) %>% 
+      filter(Ticker == Ticker_name) %>% 
+      collect() %>% 
+      auto_select_extra(df_process$X) %>% 
+      filter(Date >= ymd(start_date), 
+             Date <= ymd(end_date)
+      )
+    
+    df_y <- tbl(db, df_process$data_source_y) %>% 
+      filter(Ticker == Ticker_name) %>% 
+      collect() %>% 
+      auto_select_extra(df_process$Y) %>% 
+      filter(Date >= ymd(start_date), 
+             Date <= ymd(end_date)
+      )
+    
+    df_z <- tbl(db, df_process$data_source_z) %>% 
+      filter(Ticker == Ticker_name) %>% 
+      collect() %>% 
+      auto_select_extra(df_process$Z) %>% 
+      filter(Date >= ymd(start_date), 
+             Date <= ymd(end_date)
+      )
+    
+    # Is the period Annual
+    if (df_process$Period == "annual") {
+      df_x <- df_x %>% 
+        mutate(year = year(Date)) 
+      
+      df_y <- df_y %>% 
+        mutate(year = year(Date)) 
+      
+      df_z <- df_z %>% 
+        mutate(year = year(Date)) 
+      
+      df_collect <- df_x %>% 
+        bind_rows(df_y, df_z) %>%   
+        mutate(Period = "Annual") %>% 
+        select(Fields, Period, Date, year, Value) %>% 
+        group_by(Fields, year) %>% 
+        arrange(desc(Date)) %>% 
+        slice(1) %>% 
+        ungroup() %>% 
+        select(-Date) %>% 
+        pivot_wider(names_from = "Fields", values_from = "Value") 
+      # mutate_if(.predicate = anyNA, .funs = function(x){if_else(is.na(x), 0, as.numeric(x))})
+    } else {
+      df_x <- df_x %>% 
+        mutate(quarter = quarter(Date),
+               year = year(Date)) 
+      
+      df_y <- df_y %>% 
+        mutate(quarter = quarter(Date),
+               year = year(Date)) 
+      
+      df_z <- df_z %>% 
+        mutate(quarter = quarter(Date),
+               year = year(Date))
+      
+      df_collect <- df_x %>% 
+        bind_rows(df_y, df_z) %>% 
+        mutate(Period = "Quarter") %>% 
+        select(Fields, Period, Date, year, quarter, Value) %>% 
+        group_by(Fields, year, quarter) %>% 
+        arrange(desc(Date)) %>% 
+        slice(1) %>% 
+        ungroup() %>% 
+        select(-Date) %>% 
+        pivot_wider(names_from = "Fields", values_from = "Value") 
+      # mutate_if(.predicate = anyNA, .funs = function(x){if_else(is.na(x), 0, as.numeric(x))})
+    } 
+  }
+  
+  # print(df_collect)
+  # Calculate Formula
+  if (is.na(df_process$Z)) {
+    output <- df_collect %>% 
+      rename_variable(data_ref = df_process) %>% 
+      mutate( new_col = eval(parse(text = df_process$Formula)) )  %>% 
+      select(-c(X,Y)) %>% 
+      pivot_longer(cols = new_col, names_to =  "Fields", values_to = "Value") %>% 
+      mutate(Fields = df_process$Fields) %>% 
+      arrange(year)
+  } else {
+    output <- df_collect %>% 
+      rename_variable(data_ref = df_process) %>% 
+      mutate( new_col = eval(parse(text = df_process$Formula)) )  %>% 
+      select(-c(X,Y,Z)) %>% 
+      pivot_longer(cols = new_col, names_to =  "Fields", values_to = "Value") %>% 
+      mutate(
+        Fields = df_process$Fields
+      ) %>% 
+      arrange(year)
+  }
+  
+  return(output)
+}
+
+
+#* @apiTitle Plumber Example API
+
+
+# echo back the input -----------------------------------------------------
+
+#* Echo back the input
+#* @param input input json
+#* @serializer unboxedJSON
+#* @post /echo
+function(req, input){
+  
+  fromJSON(req$postBody, flatten = FALSE)
+  
+}
+
+
+# stock card - stock price ---------------------------------------------------
+
+#* Stock Price Chart
+#* @param ticker Ticker Name
+#* @param currency IDR or USD
+#* @param type Chart Type (line, candlestick, area)
+#* @param id Container
+#* @serializer custom_jarvis
+#* @post /stock-card/stockprice
+function(ticker, currency, type, id){
+  
+  # Connection SQL
+  
+  conn <- dbConnect(
+    MariaDB(),
+    user = "jarvisalgoritma",
+    password = "Jarvis@2020",
+    dbname = "jarvis-algoritma",
+    host = "api.jarvisasset.com"
+  )
+
+  dbListTables(conn)
+  
+  
+  # parameterize
+  
+  get_ticker <- ticker
+  
+  
+  pxstocks_data <- readRDS("data/pxstocks_data.RDS")
+  
+  # get data
+  
+  ma_ordo <- 30
+  currency <- currency # IDR or USD
+  chart_type <- type # candlestick, line, column, area
+  
+  
+  usd_idr <- tbl(conn, "lv3_px_currency") %>%
+    filter(Ticker %in% currency) %>%
+    select(Date, Value) %>%
+    collect() %>%
+    mutate_at("Date", ymd)
+  
+  
+  date_flags <- ymd(c("2017-04-17", "2019-08-17"))
+  title_flags <- c("#E1", "#E2")
+  text_flags <- c("An interesting event #1", "An interesting event #2")
+  
+  
+  flags <- data_frame(
+    date = date_flags,
+    title = title_flags,
+    text = text_flags
+  )
+  
+  # data aggregation
+  
+  pxstocks_agg <- pxstocks_data %>%
+    select(-ID_Unique) %>%
+    mutate_at("Date", ymd) %>%
+    left_join(usd_idr, by = "Date") %>%
+    mutate(Value.x = case_when(currency == "USD" ~ Value.x/Value.y,
+                               TRUE ~ Value.x)) %>%
+    select(-Value.y) %>%
+    pivot_wider(names_from = Fields, values_from = Value.x) %>%
+    rename(
+      PX.High = `PX High`,
+      PX.Close = `PX Last`,
+      PX.Open = `PX Open`,
+      PX.Low = `PX Low`
+    ) %>%
+    filter(complete.cases(.)) %>%
+    mutate(
+      MA = rollapplyr(PX.Close, ma_ordo, mean, na.rm = TRUE, fill = NA),
+      STD = rollapplyr(PX.Close, ma_ordo, sd, na.rm = TRUE, fill = NA),
+      Upper_Boll = MA + 2*STD,
+      Lower_Boll = MA - 2*STD,
+      RSI = RSI(PX.Close)
+    )
+  
+  # data viz
+  
+  pxstocks_datviz <- xts(x = pxstocks_agg %>% select(PX.Open, PX.High, PX.Low,
+                                                     PX.Close, Volume, MA, RSI,
+                                                     Upper_Boll, Lower_Boll),
+                         order.by = pxstocks_agg$Date)
+  
+  
+  # highcharts
+  
+  hc <- highchart(type = "stock") %>%
+    hc_yAxis_multiples(
+      create_yaxis(3, heights = c(3,1,1), turnopposite = TRUE)
+    ) %>%
+    hc_add_series(pxstocks_datviz, yAxis = 0, name = get_ticker, id = "stock", type = chart_type) %>%
+    hc_add_series(pxstocks_datviz$MA,  yAxis = 0, name = "MA") %>%
+    hc_add_series(pxstocks_datviz$Upper_Boll,  yAxis = 0, name = "upper") %>%
+    hc_add_series(pxstocks_datviz$Lower_Boll,  yAxis = 0, name = "lower") %>%
+    hc_add_series(flags, hcaes(x = date),
+                  type = "flags", onSeries = "stock") %>%
+    hc_add_series(pxstocks_datviz$Volume, yAxis = 1, name = "Volume", type = "column") %>%
+    hc_add_series(pxstocks_datviz$RSI, yAxis = 2, name = "RSI") %>%
+    hc_tooltip(split = FALSE, shared = TRUE) %>%
+    hc_plotOptions(
+      series = list(
+        fillOpacity = 0.1
+      )
+    ) %>%
+    hc_title(text = "This is a title with <i>margin</i> and <b>Strong or bold text</b>",
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>%
+    hc_add_theme(hc_theme_monokai())
+
+    temp <- hc$x$hc_opts
+  
+    return(temp)
+  
+}
+
+
+# stock card - relative performance ------------------------------------------
+
+#* Relative Performance
+#* @param ticker Ticker Name
+#* @param index Index Name
+#* @param sector Sector Name
+#* @param field Value
+#* @serializer custom_jarvis
+#* @post /stock-card/relative-performance
+function(ticker, index, sector, field){
+  
+  # Connection SQL
+  
+  
+  conn <- dbConnect(
+    MySQL(),
+    user = "jarvisalgoritma",
+    password = "Jarvis@2020",
+    dbname = "jarvis-algoritma",
+    host = "api.jarvisasset.com"
+  )
+  
+  dbListTables(conn)
+  
+  # parameterize
+  
+  get_ticker_rp <- ticker
+  get_index_rp <- index
+  get_sector_rp <- sector
+  get_fields_rp <- field
+  
+  # get data
+  
+  pxidx_data <-  tbl(conn, "lv3_px_index") %>% 
+    filter(Ticker %in% get_index_rp, Fields == get_fields_rp) %>% 
+    select(Date, Value) %>% 
+    collect()
+  
+  stocks_data <- tbl(conn, "lv3_px_stocks") %>% 
+    filter(Ticker %in% get_ticker_rp, Fields == get_fields_rp) %>% 
+    select(Date, Value) %>% 
+    collect()
+  
+  ticker_list_sector <- tbl(conn, "lv2_stocks") %>% 
+    filter(Sector == get_sector_rp) %>% 
+    select(Ticker) %>% 
+    collect()
+  
+  stock_sector <- tbl(conn, "lv3_px_stocks") %>% 
+    filter(Ticker %in% local(ticker_list_sector$Ticker), Fields == get_fields_rp) %>% 
+    select(Date, Value) %>% 
+    collect()
+  
+  # data aggregation
+  
+  rp_dat_agg <- stocks_data %>% 
+    rename(!! get_ticker_rp := Value) %>% 
+    left_join(pxidx_data %>%
+                rename(!! get_index_rp := Value)) %>% 
+    left_join(stock_sector %>% 
+                group_by(Date) %>% 
+                summarise(!! get_sector_rp := mean(Value)) %>% 
+                ungroup()) %>% 
+    mutate(Date = ymd(Date)) %>% 
+    filter(complete.cases(.)) %>% 
+    mutate_if(is.numeric, ~round(., digits = 2))
+  
+  # data viz
+  
+  rp_dat_vis <- xts(rp_dat_agg %>% select(-Date) , order.by = rp_dat_agg$Date)
+  
+  # highcharts
+  
+  hc <- highchart(type = "stock") %>% 
+    hc_add_series(rp_dat_vis[,1], name = get_ticker_rp) %>% 
+    hc_add_series(rp_dat_vis[,2], name = get_index_rp) %>% 
+    hc_add_series(rp_dat_vis[,3], name = get_sector_rp) %>% 
+    hc_plotOptions(series = list(compare= 'value', 
+                                 compareStart = FALSE)) %>% 
+    hc_title(text = "This is a title with <i>margin</i> and <b>Strong or bold text</b>",
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>% 
+    hc_tooltip(split = FALSE, shared = TRUE) %>% 
+    hc_yAxis(
+      title = list(text = "Value"),
+      opposite = FALSE
+    ) %>% 
+    hc_add_theme(hc_theme_monokai())
+  
+    temp <- hc$x$hc_opts
+    
+    return(temp)
+}
+
+
+# stock card - valuation chart -----------------------------------------------
+
+#* Valuation Chart
+#* @param ticker Ticker Name
+#* @param field Field Name
+#* @param index Index Name
+#* @param grouping Grouping Type
+#* @param ordo Moving Average Ordo
+#* @param output absolute, tosector, toindex
+#* @serializer custom_jarvis
+#* @post /stock-card/valuation-chart
+function(ticker, index, groping, ordo){
+  
+  con2 <- dbConnect(MariaDB(),
+                   user     = "Alvin",
+                   password = "Incorrect123",
+                   dbname   = 'researchdb',
+                   host = '192.168.10.83')
+  
+  
+  dbListTables(conn)
+  
+  ## parameterize
+  
+  input_ticker <- ticker
+  input_fields <- field
+  input_index <- index
+  input_ordo <- ordo
+  
+  ## get data
+  
+  lv4_px_stocks_valuation <- tbl(con2, "lv4_px_stocks_valuation") %>% 
+    filter(Ticker == input_ticker & Fields == input_fields) %>% 
+    select(-ID_Unique) %>% 
+    collect()
+  
+  ## data aggregation
+  
+  absolute_agg <- lv4_px_stocks_valuation %>% 
+    select(Date, Value) %>% 
+    mutate(
+      Date = ymd(Date),
+      MA =  rollapplyr(Value, input_ordo, mean, na.rm = TRUE, fill = NA),
+      mean_flat = mean(Value, na.rm = TRUE),
+      upper_bound1 = mean(Value, na.rm = TRUE) + sd(Value, na.rm = TRUE),
+      upper_bound2 = mean(Value, na.rm = TRUE) + 2*sd(Value, na.rm = TRUE), 
+      lower_bound1 = mean(Value, na.rm = TRUE) - sd(Value, na.rm = TRUE), 
+      lower_bound2 = mean(Value, na.rm = TRUE) - 2*sd(Value, na.rm = TRUE)
+    ) %>% 
+    rename(!! input_fields := Value) %>% 
+    mutate_if(is.numeric, ~round(., digits = 2))
+  
+  ## data vis
+  
+  absolute_vis <- xts(absolute_agg %>% select(-Date), order.by = absolute_agg$Date)
+  
+  ## highcharts
+  
+  absolute <- highchart(type = "stock") %>% 
+    hc_add_series(absolute_vis$PE, name = input_fields) %>% 
+    # hc_add_series(idxval_vis$upper_bound1, name = "1std", dashStyle = "shortdash", color = "gray") %>%
+    # hc_add_series(idxval_vis$lower_bound1, name = "1std", dashStyle = "shortdash", color = "gray") %>%
+    # hc_add_series(idxval_vis$upper_bound2, name = "2std", dashStyle = "longdash", color = "gray") %>%
+    # hc_add_series(idxval_vis$lower_bound2, name = "2std", dashStyle = "longdash", color = "gray") %>%
+    # hc_add_series(idxval_vis$mean_flat, name = "mean", dashStyle = "shortdash", color = "gray") %>%
+    hc_add_series(absolute_vis$MA, name = "MA", dashStyle = "shortdash") %>%
+    hc_title(text = "This is a title with <i>margin</i> and <b>Strong or bold text</b>",
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>% 
+    hc_tooltip(split = FALSE, shared = TRUE) %>% 
+    hc_add_theme(hc_theme_monokai())
+  
+  
+  # Relative to Sector
+  
+  Input.Grouping <- grouping
+  Input.Index <- index
+  
+  ### Step 1 - Load & Manipulate Stocks Data
+  
+  lv2_stocks <- tbl(con2,"lv2_stocks") %>% collect()
+  
+  lv4_px_stocks_valuation <- tbl(con2,"lv4_px_stocks_valuation") %>% 
+    filter(Ticker %in% input_ticker) %>% 
+    collect() %>% 
+    select(-1) %>% 
+    left_join(
+      select(lv2_stocks, Ticker, Input.Grouping),  by = c("Ticker")
+    ) %>% 
+    rename(
+      Sector = Input.Grouping
+    )
+  
+  
+  ### Step 2 - Load Sector Data
+  
+  lv4_px_sector_valutaion <- tbl(con2,"lv4_px_sector_valuation") %>% 
+    filter(Grouping == Input.Grouping) %>% 
+    collect() %>% 
+    select(-1) %>% 
+    rename(Sector="Ticker")
+  
+  ### Step 3 - Join Stocks & Sector
+  
+  relative_to_sector <- lv4_px_stocks_valuation %>% 
+    left_join(lv4_px_sector_valutaion, by=c("Date","Fields","Sector")) %>% 
+    filter(Date >= "2010-01-01") %>% 
+    mutate(Value = Value.x/Value.y-1) %>% 
+    filter(!is.na(Value), Fields == input_fields) %>% 
+    select(Ticker, Fields, Date, Value)
+  
+  # Highcharts relative to sector
+  
+  rel_sector_agg <- relative_to_sector %>% 
+    mutate(
+      MA = rollapplyr(
+        Value, input_ordo, mean, na.rm = TRUE, fill = NA
+      )
+    ) %>% 
+    mutate_if(is.numeric, ~round(., digits = 2))
+  
+  rel_sector_davis <- xts(
+    rel_sector_agg %>% 
+      select(-c(Date, Fields, Ticker)),
+    order.by = rel_sector_agg$Date
+  )
+  
+  tosector <- highchart(type = "stock") %>% 
+    hc_add_series(rel_sector_davis$Value, type = "line") %>% 
+    hc_add_series(rel_sector_davis$MA, dashStyle = "shortdash") %>% 
+    hc_title(text = "This is a title with <i>margin</i> and <b>Strong or bold text</b>",
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>% 
+    hc_tooltip(split = FALSE, shared = TRUE) %>% 
+    hc_add_theme(hc_theme_monokai())
+  
+  # Relative to Index
+  
+  lv4_px_index_valuation <- tbl(con2,"lv4_px_index_valuation") %>% 
+    filter(Ticker %in% input_index, Fields == input_fields)%>% 
+    collect() %>% 
+    select(-1)
+  
+  relative_to_index <- lv4_px_stocks_valuation %>% 
+    filter(Fields == input_fields) %>% 
+    left_join(lv4_px_index_valuation, by=c("Date")) %>% 
+    filter(Date>="2010-01-01") %>% 
+    mutate(Value = Value.x/Value.y-1) %>% 
+    filter(!is.na(Value)) %>% 
+    select(Date, Value)
+  
+  
+  rel_index_agg <- relative_to_index %>% 
+    mutate(
+      MA = rollapplyr(
+        Value, input_ordo, mean, na.rm = TRUE, fill = NA
+      )
+    ) %>% 
+    mutate_if(is.numeric, ~round(., digits = 2))
+  
+  rel_index_davis <- xts(
+    rel_index_agg %>% select(-Date),
+    order.by = rel_index_agg$Date
+  )
+  
+  toindex <- highchart(type = "stock") %>% 
+    hc_add_series(rel_index_davis$Value, type = "line") %>% 
+    hc_add_series(rel_index_davis$MA, dashStyle = "shortdash") %>% 
+    hc_title(text = "This is a title with <i>margin</i> and <b>Strong or bold text</b>",
+             margin = 20, align = "left",
+             style = list(color = "#ffc000", useHTML = TRUE)) %>%
+    hc_subtitle(text = "And this is a subtitle with more information",
+                align = "left", style = list(color = "#2b908f", fontWeight = "bold")) %>% 
+    hc_tooltip(split = FALSE, shared = TRUE) %>% 
+    hc_add_theme(hc_theme_monokai())
+  
+   temp <- function(input){
+     
+     input <- output
+     
+     if(input == "stock"){
+       
+       absolute$x$hc_opts
+       
+     } else if(input == "sector"){
+       
+       tosector$x$hc_opts
+       
+     } else {
+       
+       toindex$x$hc_opts
+       
+     }
+     
+   }
+   
+   return(temp)
+  
+}
+
+
+# scoring - technical indikators ------------------------------------------
+
+#* Technical Indicator MACD
+#* @param ticker Ticker Name
+#* @param n_fast short moving average
+#* @param n_slow fast moving average
+#* @param n_signal signal line
+#* @serializer unboxedJSON
+#* @post /scoring/macd
+function(ticker, n_fast, n_slow, n_signal){
+  
+  conn <- dbConnect(
+    MySQL(),
+    user = "jarvisalgoritma",
+    password = "Jarvis@2020",
+    dbname = "jarvis-algoritma",
+    host = "api.jarvisasset.com"
+  )
+  
+  # parameterize
+  
+  get_ticker <- ticker
+  n_fast <-  n_fast
+  n_slow <- n_fast
+  n_sig <-  n_signal
+  
+  ma_ordo <- 30
+  currency <- "IDR" # IDR or USD
+  chart_type <- "line" # candlestick, line, column, area
+  
+  
+  date_flags <- ymd(c("2017-04-17", "2019-08-17"))
+  title_flags <- c("#E1", "#E2")
+  text_flags <- c("An interesting event #1", "An interesting event #2")
+  
+  
+  # custom function
+  
+  macd_func <- function (price,fast,slow,signal){
+    MA_fast <- EMA(price, fast)
+    MA_slow <- EMA(price, slow)
+    MACD <- MA_fast - MA_slow
+    signal <- EMA(MACD, signal)
+    output <- cbind(MA_fast, MA_slow, MACD, signal)
+    colnames(output) <- c(paste0("MA",fast), paste0("MA", slow), "MACD","signal")
+    output <- as_tibble(output)
+    return(output)
+  }
+  
+  
+  # get data
+  
+  pxstocks_data <- tbl(conn, "lv3_px_stocks") %>% 
+    filter(Ticker == get_ticker, Fields %in% c("PX Open", "PX High", "PX Low", "PX Last", "Volume")) %>% 
+    collect()
+  
+  usd_idr <- tbl(conn, "lv3_px_currency") %>%
+    filter(Ticker %in% currency) %>% 
+    select(Date, Value) %>%
+    collect() %>% 
+    mutate_at("Date", ymd) 
+  
+  
+  
+  flags <- data_frame(
+    date = date_flags,
+    title = title_flags,
+    text = text_flags
+  )
+  
+  # data aggregation
+  
+  pxstocks_agg <- pxstocks_data %>% 
+    select(-ID_Unique) %>% 
+    mutate_at("Date", ymd) %>% 
+    left_join(usd_idr, by = "Date") %>%
+    mutate(Value.x = case_when(currency == "USD" ~ Value.x/Value.y,
+                               TRUE ~ Value.x)) %>%
+    select(-Value.y) %>%
+    pivot_wider(names_from = Fields, values_from = Value.x) %>% 
+    rename(
+      PX.High = `PX High`,
+      PX.Close = `PX Last`,
+      PX.Open = `PX Open`,
+      PX.Low = `PX Low`
+    ) %>% 
+    filter(complete.cases(.)) %>% 
+    mutate(
+      MA = rollapplyr(PX.Close, ma_ordo, mean, na.rm = TRUE, fill = NA),
+      STD = rollapplyr(PX.Close, ma_ordo, sd, na.rm = TRUE, fill = NA),
+      Upper_Boll = MA + 2*STD,
+      Lower_Boll = MA - 2*STD,
+      RSI = RSI(PX.Close)
+    ) %>% 
+    bind_cols(
+      macd_func(price = .$PX.Close, fast = n_fast, slow = n_slow, signal = n_sig)
+    )
+  
+  pxstocks_agg
+  
+}
+
+
+# scoring - growth ranking ------------------------------------------------
+
+#* Scoring Growth Ranking
+#* @param grouping
+#* @param type
+#* @param field
+#* @serializer unboxedJSON
+#* @post /scoring/ranking
+function(grouping, type, field){
+  
+  
+  stock_absolute_table <- readRDS(file = "data/stock_table.RDS")
+  FS.Sector.Growth.Q <- readRDS( file = "data/sector_q.RDS")
+  FS.Sector.Growth.A <- readRDS(file = "data/sector_a.RDS")
+  stock_absolute_long <- readRDS( file = "data/stock_abs.RDS")
+  stock_class_long <- readRDS(file = "data/stock_class.RDS")
+  
+    temp_out <- FS.Sector.Growth.A %>% 
+      select(-ID_Unique) %>% 
+      filter(year(Date) == "2018") %>% 
+      arrange(desc(Value)) %>% 
+      group_by(Grouping, Fields, Growth) %>% 
+      mutate(
+        `Ranking Grouping` = dense_rank(desc(Value))
+      ) %>% 
+      ungroup() %>%
+      arrange(Fields, `Ranking Grouping`) %>%  
+      filter(Grouping == grouping) %>% 
+      rename(!! grouping := Ticker) %>% 
+      select(-Value) %>% 
+      left_join(
+        select(stock_absolute_long, Ticker, !! grouping, Fields, Date, Growth, Value)
+      ) %>% 
+      group_by(.dots = grouping, Fields, Growth) %>%
+      mutate(
+        `Ranking Stock` = dense_rank(desc(Value))
+      ) %>%
+      ungroup() %>%
+      # select(-Value) %>% 
+      left_join(
+        select(stock_class_long, Ticker, !! grouping, Fields, Date, Growth, Class)
+      ) %>% 
+      mutate(
+        Scoring = case_when(
+          Class == "Turning Profit" ~ 1000,
+          Class == "Low Base" ~ 2000,
+          Class == "Normal" ~ 3000,
+          Class == "Smaller Loss" ~ 4000,
+          Class == "Bigger Loss" ~ 5000,
+          Class == "Turning Loss" ~ 6000
+        )
+      ) %>% 
+      group_by(
+        Class, Growth
+      ) %>% 
+      mutate(
+        `Adj Rank` = dense_rank(desc(Value))
+      ) %>% 
+      ungroup() %>% 
+      mutate(
+        `Ranking Stock` = case_when(
+          Class == "Normal" ~ Scoring + `Adj Rank`,
+          TRUE ~ Scoring 
+        )
+      ) %>% 
+      arrange(`Ranking Stock`)
+    
+    out <- temp_out %>% 
+      filter(Fields == field, Growth == type) %>% 
+      select(Ticker, !! grouping, Fields, Growth, `Ranking Grouping`, `Ranking Stock`)
+    
+    return(out)
+  
+}
+
+
+# scoring - stock growth --------------------------------------------------
+
+#* Scoring Stock Growth
+#* @serializer unboxedJSON
+#* @post /scoring/stock-growth
+function(){
+  
+  stock_absolute_table <- readRDS(file = "data/stock_table.RDS")
+  stock_absolute_table
+  
+}
+
+
+# scoring - technical -----------------------------------------------------
+
+#* Scoring technical
+#* @serializer unboxedJSON
+#* @param ticker Input multiple ticker
+#* @param cutloss Maximum days for cutloss
+#* @param n_ma Moving Average 
+#* @param year Filter data only which more than year input
+#* @param n_fast MACD short 
+#* @param n_slow MACD long
+#* @param n_sig MACD signal
+#* @post /scoring/technical
+function(ticker, cutloss, n_ma, year, n_fast, n_slow, n_sig){
+  
+  # Connection SQL
+  
+  conn <- dbConnect(
+    MySQL(),
+    user = "jarvisalgoritma",
+    password = "Jarvis@2020",
+    dbname = "jarvis-algoritma",
+    host = "api.jarvisasset.com"
+  )
+  
+  # parameterize
+  
+  input_ticker <- ticker
+  
+  input_ma <- n_ma
+  input_max <- cutloss
+  input_year <- year
+  
+  # get data
+  
+  
+  lv3_px_stocks <- tbl(conn, "lv3_px_stocks") %>% 
+    filter(Ticker %in% input_ticker, 
+           Fields %in% c("PX Last")) %>% 
+    collect() %>% 
+    filter(
+      year(ymd(Date)) == input_year
+    )
+  
+  # bollinger band ----------------------------------------------------------
+  
+  bollinger <- lv3_px_stocks %>% 
+    select(-ID_Unique) %>% 
+    mutate_at("Date", ymd) %>% 
+    pivot_wider(
+      names_from = "Fields",
+      values_from = "Value"
+    ) %>% 
+    rename(
+      PX.Close = `PX Last`
+    ) %>% 
+    filter(complete.cases(.)) %>% 
+    group_by(Ticker) %>% 
+    mutate(
+      MA = rollapplyr(PX.Close, input_ma, mean, na.rm = TRUE, fill = NA),
+      STD = rollapplyr(PX.Close, input_ma, sd, na.rm = TRUE, fill = NA),
+      Upper_Boll = MA + 2*STD,
+      Lower_Boll = MA - 2*STD,
+      RSI = RSI(PX.Close)
+    ) %>% 
+    select(-c(MA,STD,RSI)) %>% 
+    ungroup() %>% 
+    filter(complete.cases(.)) %>% 
+    group_by(Ticker) %>% 
+    pad() %>% 
+    mutate(
+      PX.Close = na.locf(PX.Close, fromLast = FALSE),
+      Upper_Boll = na.locf(Upper_Boll, fromLast = FALSE),
+      Lower_Boll = na.locf(Lower_Boll, fromLast = FALSE),
+      Signal = case_when(
+        PX.Close > Upper_Boll ~ "Sell",
+        PX.Close < Lower_Boll ~ "Buy",
+        TRUE ~ "Hold"
+      ),
+      Signal = case_when(
+        Date == min(Date) ~ "Buy",
+        TRUE ~ Signal
+      ),
+      `Cut Loss` = Date + days(input_max)
+    ) %>% 
+    select(Ticker, Date, `Cut Loss`, everything(.)) %>% 
+    ungroup()
+  
+  # MACD --------------------------------------------------------------------
+
+  
+  macd <- lv3_px_stocks %>% 
+    select(-ID_Unique) %>% 
+    mutate_at("Date", ymd) %>% 
+    pivot_wider(
+      names_from = "Fields",
+      values_from = "Value"
+    ) %>% 
+    rename(
+      PX.Close = `PX Last`
+    ) %>% 
+    filter(complete.cases(.)) %>% 
+    group_by(Ticker) %>% 
+    mutate(
+      `MA Fast` = EMA(PX.Close, n_fast),
+      `MA Slow` = EMA(PX.Close, n_slow),
+      `MACD` = `MA Fast` - `MA Slow`,
+      Signal = EMA(`MACD`, n_sig),
+      `+1SD` = mean(MACD, na.rm = TRUE) + sd(MACD, na.rm = TRUE),
+      `-1SD` = mean(MACD, na.rm = TRUE) - sd(MACD, na.rm = TRUE)
+    ) %>% 
+    select(
+      Ticker, Date, PX.Close, MACD, `+1SD`, `-1SD`
+    ) %>% 
+    ungroup() %>% 
+    filter(complete.cases(.)) %>% 
+    group_by(Ticker) %>% 
+    pad() %>% 
+    mutate(
+      PX.Close = na.locf(PX.Close, fromLast = FALSE),
+      MACD = na.locf(MACD, fromLast = FALSE),
+      `+1SD` = na.locf(`+1SD`, fromLast = FALSE),
+      `-1SD` = na.locf(`-1SD`, fromLast = FALSE),
+      Signal = case_when(
+        MACD < `-1SD` ~ "Buy",
+        MACD > `+1SD` ~ "Sell",
+        TRUE ~ "Ignore"
+      ),
+      Signal = case_when(
+        Date == min(Date) ~ "Buy",
+        TRUE ~ Signal
+      ),
+      `Cut Loss` = Date + days(30)
+    ) %>% 
+    select(Ticker, Date, `Cut Loss`, everything(.)) %>% 
+    ungroup()
+  
+  
+  
+  # RSI ---------------------------------------------------------------------
+  
+  rsi_upper <- 70
+  rsi_lower <- 30
+  
+  rsi <- lv3_px_stocks %>% 
+    select(-ID_Unique) %>% 
+    mutate_at("Date", ymd) %>% 
+    pivot_wider(
+      names_from = "Fields",
+      values_from = "Value"
+    ) %>% 
+    rename(
+      PX.Close = `PX Last`
+    ) %>% 
+    filter(complete.cases(.)) %>% 
+    group_by(Ticker) %>% 
+    mutate(
+      RSI = RSI(price = PX.Close, n = 30)
+    ) %>% 
+    select(
+      Ticker, Date, PX.Close, RSI
+    ) %>% 
+    ungroup() %>% 
+    filter(complete.cases(.)) %>% 
+    group_by(Ticker) %>% 
+    pad() %>% 
+    mutate(
+      PX.Close = na.locf(PX.Close, fromLast = FALSE),
+      RSI = na.locf(RSI, fromLast = FALSE),
+      Upper = 70,
+      Lower = 30,
+      Signal = case_when(
+        RSI > Upper ~ "Sell",
+        RSI < Lower ~ "Buy",
+        TRUE ~ "Ignore"
+      ),
+      Signal = case_when(
+        Date == min(Date) ~ "Buy",
+        TRUE ~ Signal
+      ),
+      `Cut Loss` = Date + days(input_max)
+    ) %>% 
+    select(Ticker, Date, `Cut Loss`, everything(.)) %>% 
+    ungroup()
+  
+  
+  # loop function -----------------------------------------------------------
+  
+  technical_func <- function(x){
+    
+    date_buy <- x %>% 
+      group_by(Ticker) %>% 
+      filter(Signal == "Buy") %>% 
+      arrange(Date) %>% 
+      arrange(Ticker) %>% 
+      mutate(
+        duration = Date - lag(Date),
+        duration = ifelse(
+          is.na(duration), input_max + 1, duration
+        )
+      ) %>% 
+      filter(duration >= input_max) %>%
+      select(Date, `Cut Loss`, Signal) %>% 
+      arrange(Ticker) %>% 
+      ungroup() %>% 
+      filter(complete.cases(.)) 
+    
+    date_sell <- x %>% 
+      group_by(Ticker) %>% 
+      filter(Signal == "Sell") %>% 
+      select(Ticker, Date, Signal) %>% 
+      arrange(Ticker) %>% 
+      ungroup()
+    
+    ticker <- c()
+    buy <- c() %>% ymd()
+    sell <- c() %>% ymd()
+    out <- data.frame()
+    
+    for (i in 1:nrow(date_buy)) {
+      
+      temp_ticker <- date_buy %>% 
+        slice(i) %>% 
+        pull(Ticker)
+      
+      temp_date <- date_buy %>% 
+        slice(i) %>% 
+        pull(Date)
+      
+      temp_cutloss <- date_buy %>% 
+        slice(i) %>% 
+        pull(`Cut Loss`)
+      
+      temp_data <- date_sell %>% 
+        filter(
+          Ticker == temp_ticker,
+          Date > temp_date,
+          Date <= temp_cutloss
+        )
+      
+      if(nrow(temp_data) == 0){
+        
+        ticker[i] <- temp_ticker
+        buy[i] <- temp_date
+        sell[i] <- temp_cutloss
+        
+      } else {
+        
+        action_sell <- temp_data %>% 
+          slice(1) %>% 
+          pull(Date)
+        
+        ticker[i] <- temp_ticker
+        buy[i] <- temp_date
+        sell[i] <- action_sell
+        
+      }
+      
+      
+      out <- tibble(
+        "Ticker" = c(ticker),
+        "Buy" = c(buy),
+        "Sell" = c(sell)
+      )
+    }
+    
+    return <- out %>% 
+      pivot_longer(cols = c(Buy, Sell),
+                   names_to = "Action",
+                   values_to = "Date") %>% 
+      left_join(
+        y = select(x, Date, Ticker,  PX.Close), 
+        by = c("Ticker", "Date")
+      ) %>% 
+      group_by(
+        Ticker
+      ) %>% 
+      mutate(
+        Return = ifelse(
+          Action == "Buy", lead(PX.Close, 1) / PX.Close - 1, "Ignore"
+        )
+      ) %>% 
+      filter(Return != "Ignore") %>% 
+      select(Date, Return)
+    
+    table <- out %>% 
+      left_join(return, by = c("Buy" = "Date", "Ticker")) %>% 
+      filter(complete.cases(.)) %>% 
+      mutate(
+        Return = as.numeric(Return)
+      ) %>%
+      group_by(Ticker) %>%
+      summarise(
+        Frequency = n(),
+        `Mean Return` = mean(Return, na.rm = TRUE),
+        `Median Return` = median(Return, na.rm = TRUE),
+        `% Positive` = sum(Return > 0),
+        `Max Return` = max(Return),
+        `Min Return` = min(Return)
+      ) %>% 
+      mutate_if(is.numeric, ~round(., digits = 5)) %>% 
+      ungroup()
+    
+  }
+  
+  
+  dat <- list(rsi, bollinger, macd)
+  
+  out <- map(dat, technical_func)
+  
+  method_name <- c("rsi", "bollinger", "macd")
+  
+  map2(out, method_name, ~bind_cols(.x, Method = .y) %>% 
+         select(Ticker, Method, everything(.))) %>% 
+    do.call(bind_rows, .)
+  
+  
+}
+
+
+
+
+# Stock Ratio -------------------------------------------------------------
+
+#* Stock Ratio
+#* @param ticker
+#* @param startdate
+#* @param enddate
+#* @json
+#* @post /stock-ratio
+function(ticker, startdate, enddate){
+  
+  Ticker_name <- ticker
+  start_date <- startdate
+  end_date <- enddate
+  
+  con <- dbConnect(MariaDB(), 
+                   user = "jarvisalgoritma",
+                   password = "Jarvis@2020",
+                   dbname = "jarvis-algoritma",
+                   host = "api.jarvisasset.com")
+  
+  db <- con
+  
+  cat(paste("Ticker :", Ticker_name,"\n"))
+  
+  range_year <- (str_extract(start_date, pattern = "[0-9]+") %>% as.numeric()):(str_extract(end_date, pattern = "[0-9]+") %>% as.numeric())
+  
+  formula_table <- tbl(db,"lv2_formula_ratio") %>% 
+    collect()
+  
+  stock_data <- formula_table %>% 
+    filter(Data == "Stocks")
+  
+  tbl_nest <- stock_data %>% 
+    nest( -ID_Unique )
+  
+  list_output <- furrr::future_map(tbl_nest$data, .f = calculate_stocks, 
+                                   # Argument for function collect stock data
+                                   db = db, Ticker_name = Ticker_name, start_date = start_date, end_date = end_date)
+  
+  list_output <- bind_rows(list_output) %>% 
+    distinct() %>% 
+    mutate(
+      Ticker = Ticker_name,
+      Date = case_when(
+        Period == "Annual" ~ paste0(year, "-12-31"),
+        Period == "Quarter" & quarter == 1 ~ paste0(year, "-3-31"),
+        Period == "Quarter" & quarter == 2 ~ paste0(year, "-6-30"),
+        Period == "Quarter" & quarter == 3 ~ paste0(year, "-9-30"),
+        Period == "Quarter" & quarter == 4 ~ paste0(year, "-12-31")
+      )) %>%
+    select(Period, Ticker, Date, Fields, Value)
+  
+  return(list_output)
+}

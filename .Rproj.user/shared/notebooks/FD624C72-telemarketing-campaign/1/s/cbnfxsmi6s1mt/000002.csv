@@ -1,0 +1,8 @@
+"0","result <- model_fit %>% "
+"0","  # slice(2:3) %>% "
+"0","  mutate("
+"0","    prediction = map(modelfits, ~predict(.x, .x$train_x)),"
+"0","    acc = map2(prediction, train_y, ~MLmetrics::Accuracy(.x, .y)),"
+"0","    recall = map2(prediction, train_y, ~MLmetrics::Recall(.x, .y, positive = 1)),"
+"0","    precision = map2(prediction, train_y, ~MLmetrics::Precision(.x,.y, positive = 1))"
+"0","  )"

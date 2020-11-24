@@ -1,0 +1,4 @@
+"0","best_model <- result %>% "
+"0","  select(modelName, acc, recall, precision, prediction) %>% "
+"0","  unnest(cols = c(acc, recall, precision)) %>% "
+"0","  arrange(desc(acc))"

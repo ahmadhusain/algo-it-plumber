@@ -1,0 +1,3 @@
+"0","pred_result %>% "
+"0","  roc_curve(Attrition, .pred_Yes) %>% "
+"0","  autoplot()"
