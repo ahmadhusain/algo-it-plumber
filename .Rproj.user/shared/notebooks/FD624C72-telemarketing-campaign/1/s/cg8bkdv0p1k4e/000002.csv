@@ -1,3 +1,0 @@
-"0","srs_variable <- bank %>% "
-"0","  select_if(is.factor) %>% "
-"0","  colnames()"

@@ -6,7 +6,7 @@ Untuk mempublikasikan suatu model dalam suatu sistem yang terintegrasi, model da
 
 # Plumber
 
-Pada repositori ini tersedian demo plumber untuk 1 model telemarketing yang memprediksi apakah seorang customer akan mengikuti program telemarketing yang dipromosikan atau tidak. Dokumentasi pembuatan model serta file terkait model terdapat pada folder **telemarketing**.
+Pada repositori ini tersedia demo plumber untuk 1 model telemarketing yang memprediksi apakah seorang customer akan mengikuti program telemarketing yang dipromosikan atau tidak. Dokumentasi pembuatan model serta file terkait model terdapat pada folder **telemarketing**.
 
 Cara mencoba demo plumber:
 

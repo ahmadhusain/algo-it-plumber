@@ -1,7 +1,0 @@
-"0","model_list <- list(XgBoost = xgb,"
-"0","                   GradBoost = gbm,"
-"0","                   RandomForest = rf,"
-"0","                   DecisionTree = dtree) %>%"
-"0","  enframe(name = 'modelName',value = 'model')"
-"0",""
-"0","model_list"
