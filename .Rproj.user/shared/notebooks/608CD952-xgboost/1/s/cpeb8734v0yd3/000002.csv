@@ -1,2 +1,0 @@
-"0","set.seed(100)"
-"0","att_folds <- vfold_cv(att_train, strata = Attrition, v = 10)"

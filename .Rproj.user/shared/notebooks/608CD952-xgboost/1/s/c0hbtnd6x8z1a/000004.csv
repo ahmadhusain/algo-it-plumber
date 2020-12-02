@@ -1,4 +1,0 @@
-"0","att_clean %>% "
-"0","  ggplot(aes(x = Department, fill = Attrition)) +"
-"0","  geom_bar(position = ""fill"") +"
-"0","  scale_fill_brewer(palette = ""Set1"")"

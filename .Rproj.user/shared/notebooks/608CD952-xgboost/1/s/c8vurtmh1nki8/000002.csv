@@ -1,3 +1,0 @@
-"0","# melakukan final modeling menggunakan full data train"
-"0","final_model_all <-  last_fit(final_xgb,att_split)"
-"0","# saveRDS(final_model, ""final_model.rds"")"

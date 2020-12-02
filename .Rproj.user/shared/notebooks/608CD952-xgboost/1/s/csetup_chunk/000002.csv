@@ -1,4 +1,0 @@
-"0","knitr::opts_chunk$set(echo = TRUE, "
-"0","                      warning = FALSE, "
-"0","                      message = FALSE, fig.width = 8)"
-"0","options(scipen = 123)"

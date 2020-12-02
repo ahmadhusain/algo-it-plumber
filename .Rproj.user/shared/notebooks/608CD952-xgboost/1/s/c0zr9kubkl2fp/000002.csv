@@ -1,5 +1,0 @@
-"0","library(caret)"
-"0","att_clean <- attrition %>% "
-"0","  select(-EmployeeNumber) %>% "
-"0","  select(-nearZeroVar(.)) %>% "
-"0","  mutate_at(vars(JobLevel, JobInvolvement, Education, StockOptionLevel, Attrition), as.factor)"
