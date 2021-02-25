@@ -22,19 +22,19 @@ Berikut adalah script API yang telah dibuat:
 
 ![](img/plumber.png)
 
-Pada contoh di atas, dibuat **metode request** [POST](https://rapidapi.com/blog/api-glossary/post/) menggunakan comment `@post` dan dicantumkan pula [end-point](https://rapidapi.com/blog/api-glossary/endpoint/) nya yaitu `/api-predict`. Pada line berikutnya dapat kita masukkan model prediksi beserta code yang digunakan untuk menggunakan model tersebut.
+Pada contoh di atas, dibuat API untuk **metode request** [POST](https://rapidapi.com/blog/api-glossary/post/) menggunakan comment `@post` dan dicantumkan pula [end-point](https://rapidapi.com/blog/api-glossary/endpoint/)-nya yaitu `/api-predict`. Pada line berikutnya dapat kita masukkan model prediksi beserta code untuk menggunakan model tersebut.
 
 **Cara mencoba demo plumber:**
 
 1. Buka file `plumber.R`
 2. **Run** plumber.R atau tekan `ctrl + enter`
-3. Akan terbuka tampilan swagger (demo API) seperti yang tertera di bawah. Kita kemudian bisa mendapatkan URL API yang dibutuhkan.
+3. Akan terbuka tampilan swagger (demo API) seperti yang tertera di bawah. Kita bisa mendapatkan URL API yang kita butuhkan.
 
 ![](img/swagger.png)
 
 a. Scroll ke bawah hingga tertera pilihan request. Pada contoh ini hanya terdapat request **POST** untuk *Prediksi data baru* dengan [end-point](https://rapidapi.com/blog/api-glossary/endpoint/) `api-predict`
   
-b. Pilih (tekan tombol) POST dan akan terbuka panel seperti di bawah ini. Klik tombol **Try it out**.
+b. Pilih tombol POST dan akan terbuka panel seperti di bawah ini. Klik tombol **Try it out**.
 
 ![](img/trial1.png)  
 
@@ -43,7 +43,7 @@ c.  Kemudian cari informasi **URL** sebagai berikut:
 ![](img/trial2.png)
 
 4. Copy informasi url dan paste ke sintaks ke-2 di bawah.
-5. Buka Rstudio di window baru dan masukkan 2 sintaks di bawah (Note: Jangan tutup RStudio sebelumnya untuk tetap running API)
+5. Buka Rstudio di window baru dan masukkan 2 sintaks di bawah (Note: Jangan tutup RStudio sebelumnya sehingga API tetap dijalankan)
 6. Jalankan seluruh sintaks di bawah untuk simulasi request ke API.
    
 ```
@@ -83,7 +83,7 @@ content(result)[[1]]
 
 Akan diberikan hasil prediksi: "yes"
 
-Pada tahapan di atas, kita sebagai user memberikan input berupa test dataset seperti yang tertera pada sintaks pertama. Kemudian mengubah test dataset tersebut ke format [JSON](https://www.w3schools.com/whatis/whatis_json.asp) yang dapat diterima oleh umum pada API. Kemudian kita melakukan request POST ke API dengan alamat HTTP yang tertera pada demo plumber.R yang telah kita buka sebelumnya. Pada tahap ini kita menggunakan fungsi `POST()` dari package [**httr**](https://httr.r-lib.org/) yang dikembangkan untuk memudahkan pengguna mengakses API secara umum. Selanjutnya, hasil yang kita terima dari API plumber.R (result) dapat ditampilkan.
+Pada tahapan di atas, kita sebagai user memberikan input berupa **test dataset** (bank_test) seperti yang tertera pada sintaks pertama. Kemudian mengubah test dataset tersebut ke format [JSON](https://www.w3schools.com/whatis/whatis_json.asp) yang dapat diterima oleh API. Kemudian kita melakukan request POST ke API (URL) yang telah kita ambil sebelumnya. Pada tahap ini kita menggunakan fungsi `POST()` dari package [**httr**](https://httr.r-lib.org/) yang dikembangkan untuk memudahkan user mengakses API secara umum. Selanjutnya, hasil yang kita terima dari API (result) dapat ditampilkan.
 
 Berikut adalah contoh response dari [postman](https://www.postman.com/):
 
