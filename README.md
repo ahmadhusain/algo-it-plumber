@@ -4,9 +4,7 @@ Repository **plumber-example** bertujuan untuk memberikan demonstrasi singkat me
 
 Untuk mempublikasikan suatu model dalam suatu sistem yang terintegrasi, model dan *code* yang diperlukan untuk menggunakan model tersebut dapat disusun menjadi sebuah **API**. 
 
-API (application programming interface) berfungsi layaknya mediator/jembatan yang membantu user berinteraksi dengan proses di belakang layar/sistem. API membuat user dapat melakukan beragam **request** dan mendapatkan informasi yang dibutuhkan dari sistem tersebut, tanpa perlu mengetahui seluruh proses yang terjadi di belakang layar. 
-
-Bila Anda belum familiar dengan API, ada baiknya untuk memahami concept sederhana [API](https://apimetrics.io/api-knowledge-base/apis-for-dummies/) terlebih dahulu.
+API (application programming interface) berfungsi layaknya mediator/jembatan yang membantu user berinteraksi dengan proses di belakang layar/sistem. API membuat user dapat melakukan beragam **request** dan mendapatkan informasi yang dibutuhkan dari sistem tersebut, tanpa perlu mengetahui seluruh proses yang terjadi di belakang layar. Bila Anda belum familiar dengan API, ada baiknya untuk memahami concept sederhana [API](https://apimetrics.io/api-knowledge-base/apis-for-dummies/) terlebih dahulu.
 
 Pada R, kita dapat menggunakan package **plumber** untuk membuat API.
 
@@ -18,13 +16,15 @@ Package Plumber telah menyediakan dokumentasi yang cukup lengkap terkait pengena
 
 # Example
 
-Pada repositori ini tersedia demo plumber (plumber.R) untuk sebuah **model telemarketing** yang memprediksi apakah seorang customer akan mengikuti program telemarketing yang dipromosikan atau tidak. Dokumentasi pembuatan model serta file terkait model terdapat pada folder **telemarketing**.
+Pada repositori ini tersedia demo plumber (plumber.R) untuk sebuah **model telemarketing** yang memprediksi apakah seorang customer akan mengikuti program telemarketing yang dipromosikan atau tidak. Dokumentasi pembuatan model serta file terkait model terdapat pada folder **telemarketing**. 
 
-API dibuat dengan **metode request** [POST](https://rapidapi.com/blog/api-glossary/post/) sebagai berikut:
+Berikut adalah script API yang telah dibuat:
 
 ![](img/plumber.png)
 
-Cara mencoba demo plumber:
+Pada contoh di atas, dibuat **metode request** [POST](https://rapidapi.com/blog/api-glossary/post/) menggunakan comment `@post` dan dicantumkan pula [end-point](https://rapidapi.com/blog/api-glossary/endpoint/) nya yaitu `/api-predict`. Pada line berikutnya dapat kita masukkan model prediksi beserta code yang digunakan untuk menggunakan model tersebut.
+
+**Cara mencoba demo plumber:**
 
 1. Buka file `plumber.R`
 2. **Run** plumber.R atau tekan `ctrl + enter`
@@ -32,12 +32,13 @@ Cara mencoba demo plumber:
 
 ![](img/swagger.png)
 
-  a. Scroll ke bawah hingga tertera pilihan request. Pada contoh ini hanya terdapat request **POST** untuk *Prediksi data baru* dengan [end-point](https://rapidapi.com/blog/api-glossary/endpoint/) `api-predict`
-  b. Pilih (tekan tombol) POST dan akan terbuka panel seperti di bawah ini. Klik tombol **Try it out**.
+a. Scroll ke bawah hingga tertera pilihan request. Pada contoh ini hanya terdapat request **POST** untuk *Prediksi data baru* dengan [end-point](https://rapidapi.com/blog/api-glossary/endpoint/) `api-predict`
+  
+b. Pilih (tekan tombol) POST dan akan terbuka panel seperti di bawah ini. Klik tombol **Try it out**.
 
 ![](img/trial1.png)  
 
-  c.  Kemudian cari informasi **URL** sebagai berikut:
+c.  Kemudian cari informasi **URL** sebagai berikut:
 
 ![](img/trial2.png)
 
@@ -87,3 +88,5 @@ Pada tahapan di atas, kita sebagai user memberikan input berupa test dataset sep
 Berikut adalah contoh response dari [postman](https://www.postman.com/):
 
 ![](img/postman-request.png)
+
+**Additional Note:** Pada demo ini, API masih dijalankan pada server local Anda. Namun tidak menutup kemungkinan untuk menjalankannya pada server tertentu agar dapat dibuka oleh umum/kalangan yang dituju. Selamat bereksplorasi dan semoga bermanfaat!
