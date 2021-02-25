@@ -20,33 +20,132 @@ Pada repositori ini tersedia demo plumber (plumber.R) untuk sebuah **model telem
 
 Berikut adalah script API yang telah dibuat:
 
-![](img/plumber.png)
+```
+library(plumber)
+library(tidyverse)
+library(tidymodels)
+library(jsonlite)
+library(caret)
 
-Pada contoh di atas, dibuat API untuk **metode request** [POST](https://rapidapi.com/blog/api-glossary/post/) menggunakan comment `@post` dan dicantumkan pula [end-point](https://rapidapi.com/blog/api-glossary/endpoint/)-nya yaitu `/api-predict`. Pada line berikutnya dapat kita masukkan model prediksi beserta code untuk menggunakan model tersebut.
+#* @apiTitle Internal training
+
+#* Prediksi data baru
+#* @post /api-predict
+function(req) {
+  
+  
+  # preprocess data
+  
+  unseen_data <- fromJSON(req$postBody) %>% as_tibble()
+
+  obs <- nrow(unseen_data)
+  
+  bank <- read.csv("telemarketing/bank-sub.csv", stringsAsFactors = T)
+  bind_data <- bank %>% 
+    bind_rows(unseen_data)
+  
+  
+  dmy <- dummyVars(" ~ .", data = bind_data)
+  unseen_boost <- data.frame(predict(dmy, newdata = bind_data))
+  
+  unseen_boost <- unseen_boost %>% 
+    select(-yno) %>% mutate(yyes = as.factor(yyes))
+  
+  colnames(unseen_boost) <- readRDS("telemarketing/colnames.RDS")
+  
+  # predict
+  
+  final_model <- readRDS("telemarketing/best_model.Rds")
+  
+  prediction <- predict(final_model[[1]], newdata = unseen_boost %>% tail(obs))
+  
+  ifelse(prediction == 1, "yes", "no")
+}
+
+
+
+```
+
+Pada contoh di atas, dibuat API untuk **metode _request_** [POST](https://rapidapi.com/blog/api-glossary/post/) menggunakan comment `@post`. Alasan menggunakan metode POST yaitu cenderung lebih aman karena data yang dikirim tidak terlihat di url. Selain itu dicantumkan pula [_end-point_](https://rapidapi.com/blog/api-glossary/endpoint/) untuk memperoleh _response_ hasil prediksi yang dinamakan `/api-predict`. 
+
+Pada line berikutnya dapat kita masukkan model prediksi beserta code untuk menggunakan model tersebut.
+
+Kemudian buat sebuah file script R baru yang lain dengan nama `run_api.R` yang isinya seperti berikut.
+
+```
+# run_api.R
+library(plumber)
+plumb(file = "plumber.R")$run(port = 8000)
+```
+
+Simpan kedua file tersebut dalam satu folder yang sama.
 
 **Cara mencoba demo plumber:**
 
-1. Buka file `plumber.R`
-2. **Run** plumber.R atau tekan `ctrl + enter`
-3. Akan terbuka tampilan swagger (demo API) seperti yang tertera di bawah. Kita bisa mendapatkan URL API yang kita butuhkan.
+1. Pergi ke panel *console*, cari menu **Job** kemudian pilih _**Start Local Job**_
 
-![](img/swagger.png)
+<center> 
 
-a. Scroll ke bawah hingga tertera pilihan request. Pada contoh ini hanya terdapat request **POST** untuk *Prediksi data baru* dengan [end-point](https://rapidapi.com/blog/api-glossary/endpoint/) `api-predict`
+<img src="img/local-job.png" width="60%">
+
+</center>
+
+2. Sesuaikan *working directory* dan pastikan file yang terpilih pada menu R scipt adalah `run_api.R`.
+
+<center> 
+
+<img src="img/local-job2.png" width="70%">
+
+</center>
+
+Selanjutnya klik Start. REST API plumber berhasil berjalan ketika tampilan pada tab Jobs seperti berikut ini.
+
+<center> 
+
+<img src="img/local-job3.png" width="70%">
+
+</center>
+
+
+3. Akan terbuka tampilan swagger (demo API) seperti yang tertera di bawah. Jika tidak muncul, anda dapat membuka browser dan masukkan alamat berikut: [http://localhost:8000/__docs__/](http://127.0.0.1:8000/__docs__/)
+
+<center> 
+
+<img src="img/swagger.png" width="80%">
+
+</center>
+
+* Scroll ke bawah hingga tertera pilihan request. Pada contoh ini hanya terdapat request **POST** untuk *Prediksi data baru* dengan [end-point](https://rapidapi.com/blog/api-glossary/endpoint/) `api-predict`
   
-b. Pilih tombol POST dan akan terbuka panel seperti di bawah ini. Klik tombol **Try it out**.
+* Pilih tombol POST dan akan terbuka panel seperti di bawah ini. Klik tombol **Try it out**.
 
-![](img/trial1.png)  
+<center> 
 
-c.  Kemudian cari informasi **URL** sebagai berikut:
+<img src="img/trial1.png" width="80%">
 
-![](img/trial2.png)
+</center>
 
-4. Copy informasi url dan paste ke sintaks ke-2 di bawah.
-5. Buka Rstudio di window baru dan masukkan 2 sintaks di bawah (Note: Jangan tutup RStudio sebelumnya sehingga API tetap dijalankan)
-6. Jalankan seluruh sintaks di bawah untuk simulasi request ke API.
-   
+* Kemudian cari informasi **URL** sebagai berikut:
+
+<center> 
+
+<img src="img/trial2.png" width="80%">
+
+</center>
+
+Kita dapat melakukan uji coba API pada browser, R, atau aplikasi lain seperti *Postman*. Jika API sudah berjalan dengan benar, maka akan muncul *response* status **yes** atau **no** tergantung dengan hasil prediksi model. Berikut adalah cara mencoba API dengan R:
+
+1. Buat file R script baru atau R markdown.
+2. Jalankan seluruh sintaks di bawah untuk simulasi request ke API. 
+
+
 ```
+library(tidyverse)
+library(httr)
+library(jsonlite)
+
+
+# membuat data uji coba
 bank_test <- structure(list(age = 35L, 
                             job = structure(5L, .Label = c("admin.", "blue-collar", "entrepreneur", 
                               "housemaid", "management", "retired", "self-employed", "services", 
@@ -74,14 +173,22 @@ bank_test <- structure(list(age = 35L,
 ```
 
 ```
+# mengubah data frame menjadi input json
 jbody <- toJSON(head(bank_test), pretty = T)
 
-result <- httr::POST("http://127.0.0.1:9439/api-predict", body = jbody, httr::accept_json())
+# proses request ke API
+result <- httr::POST("http://127.0.0.1:8000/api-predict",
+ body = jbody, 
+ httr::accept_json())
 
 content(result)[[1]]
 ```
 
-Akan diberikan hasil prediksi: "yes"
+```
+"yes"
+```
+
+Akan diberikan hasil prediksi: **"yes"**
 
 Pada tahapan di atas, kita sebagai user memberikan input berupa **test dataset** (bank_test) seperti yang tertera pada sintaks pertama. Kemudian mengubah test dataset tersebut ke format [JSON](https://www.w3schools.com/whatis/whatis_json.asp) yang dapat diterima oleh API. Kemudian kita melakukan request POST ke API (URL) yang telah kita ambil sebelumnya. Pada tahap ini kita menggunakan fungsi `POST()` dari package [**httr**](https://httr.r-lib.org/) yang dikembangkan untuk memudahkan user mengakses API secara umum. Selanjutnya, hasil yang kita terima dari API (result) dapat ditampilkan.
 
